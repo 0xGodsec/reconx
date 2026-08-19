@@ -1,0 +1,18 @@
+# reconx scan output
+reconx-results/
+loot/
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
