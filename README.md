@@ -43,6 +43,28 @@ Handy flags: `--no-udp`, `--no-scripts` (skip nmap `-sC`), `--no-rustscan`
 (force built-in scanner), `--top-ports N`, `--wordlist PATH`, `--parallel N`,
 `-v` (echo every command), `--no-color`.
 
+### Authenticated mode (once you have a credential)
+
+Feed reconx a credential and the SMB/WinRM/LDAP/MSSQL/SSH/Postgres modules
+re-run *authenticated* — checking access, admin (`Pwn3d!`), shares, users, and
+AD roasting, and printing the exact follow-up command (evil-winrm, xfreerdp,
+BloodHound) when a login works.
+
+```bash
+reconx dc01.corp.htb -u alex.turner -p 'Passw0rd!' -d corp.htb   # domain creds
+reconx 10.10.10.5 -u admin -H <LM:NT> --local-auth               # pass-the-hash
+reconx 10.10.10.0/24 -u svc -p 'S3cret!' --spray                 # spray one cred
+```
+
+Credential flags: `-u/--user`, `-p/--pass`, `-H/--hash` (NTLM PtH),
+`-d/--domain`, `--local-auth` (local account, not domain), `--spray` (test the
+**one** credential across every host in a CIDR via SMB/WinRM).
+
+> Credential reuse is the fastest path from foothold to root. reconx sprays a
+> **single** credential (never a list) and stops on `STATUS_ACCOUNT_LOCKED_OUT`,
+> but you should still confirm the lockout policy before spraying a domain
+> account. Authenticated checks need **netexec** (`nxc`) installed.
+
 ## How it works
 
 1. **Discovery** — rustscan if present, else a built-in async TCP connect sweep

