@@ -36,6 +36,7 @@ import ipaddress
 import os
 import re
 import shutil
+import signal
 import socket
 import sys
 import time
@@ -134,12 +135,19 @@ class Runner:
                     cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
+                    preexec_fn=os.setsid,
                 )
                 try:
                     out, _ = await asyncio.wait_for(
                         proc.communicate(), timeout=timeout or self.timeout)
                 except asyncio.TimeoutError:
-                    proc.kill()
+                    # cmd runs via a shell, so proc.kill() would only kill the
+                    # shell - tools that fork workers (smbmap, ferox, ...) keep
+                    # running. Kill the whole process group instead.
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     warn(f"timeout ({label}) after {timeout or self.timeout}s")
                     return 124, ""
                 text = out.decode(errors="replace") if out else ""
@@ -450,7 +458,9 @@ async def enum_web(host, port, name, runner, args, findings):
 
     # directory brute force (feroxbuster preferred, gobuster fallback)
     wl = args.wordlist
-    if TOOLS.get("feroxbuster"):
+    if not wl:
+        pass
+    elif TOOLS.get("feroxbuster"):
         cmd = (f"feroxbuster -u {base} -w {wl} -t 50 -q --no-recursion "
                f"-s 200,204,301,302,307,401,403 -o {os.path.join(runner.outdir, tag, 'ferox.txt')}")
         rc, out = await runner.run(cmd, None, "feroxbuster", timeout=args.enum_timeout)
@@ -1102,8 +1112,8 @@ def build_argparser():
     p.add_argument("--no-rustscan", action="store_true", help="force built-in async scanner")
     p.add_argument("--nikto", action="store_true", help="run nikto on web ports (noisy)")
     p.add_argument("--ping-sweep", action="store_true", help="liveness-check a CIDR first")
-    p.add_argument("--wordlist", default="/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt",
-                   help="dirbrute wordlist")
+    p.add_argument("--wordlist", default=None,
+                   help="dirbrute wordlist (default: auto-detect a seclists/dirbuster medium list)")
     p.add_argument("--concurrency", type=int, default=800, help="async scan concurrency")
     p.add_argument("--parallel", type=int, default=6, help="max concurrent external commands")
     p.add_argument("--host-timeout", type=float, default=1.5, help="per-port connect timeout (s)")
@@ -1124,12 +1134,42 @@ BANNER = r"""
  |_|  \___|\___\___/|_| |_|_/_/  /_/\_\
 """
 
+# candidate dirbrute wordlists, checked in order - seclists has renamed this
+# file across releases (DirBuster-2007_ prefix added, then dropped again), so
+# don't trust one hardcoded path.
+DEFAULT_WORDLISTS = [
+    "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt",
+    "/usr/share/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt",
+    "/usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt",
+    "/usr/share/wordlists/dirb/common.txt",
+]
+
+
+def resolve_wordlist(args):
+    """Fill in args.wordlist, verifying it actually exists on disk.
+
+    feroxbuster/gobuster exit 0 even when the wordlist path is bad, so a
+    silently-wrong default used to produce an empty dirbust with no warning.
+    """
+    if args.wordlist:
+        if not os.path.isfile(args.wordlist):
+            warn(f"wordlist not found: {args.wordlist} - dirbrute will be skipped")
+            args.wordlist = None
+        return
+    for cand in DEFAULT_WORDLISTS:
+        if os.path.isfile(cand):
+            args.wordlist = cand
+            return
+    warn("no default dirbrute wordlist found - pass --wordlist PATH (dirbrute will be skipped)")
+
+
 # top-1000-ish common TCP ports for --quick and the async fallback
 TOP_1000 = [1,3,7,9,13,17,19,21,22,23,25,26,37,53,79,80,81,88,106,110,111,113,119,135,139,143,144,179,199,389,427,443,444,445,465,513,514,515,543,544,548,554,587,631,646,873,990,993,995,1025,1026,1027,1028,1029,1110,1433,1434,1521,1720,1723,1755,1900,2000,2001,2049,2121,2717,3000,3128,3268,3269,3306,3389,3986,4899,5000,5009,5051,5060,5101,5190,5357,5432,5631,5666,5800,5900,5985,5986,6000,6001,6379,6646,7070,8000,8008,8009,8080,8081,8443,8888,9100,9200,9999,10000,27017,32768,49152,49153,49154,49155,49156,49157]
 
 
 async def amain(args):
     refresh_tools()
+    resolve_wordlist(args)
     runner = Runner(args.outdir, dry_run=args.dry_run,
                     timeout=args.timeout, verbose=args.verbose)
     runner.sem = asyncio.Semaphore(args.parallel)
