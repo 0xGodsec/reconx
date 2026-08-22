@@ -495,8 +495,10 @@ async def enum_smb(host, runner, args, findings):
                                            f"{tag}/auth_nxc{sub.replace('-','')}.txt", f"{nxc} smb {sub}")
                 scan_findings(out, "smb", 445, findings)
         if TOOLS.get("smbmap"):
-            rc, out = await runner.run(f"smbmap -H {host} {smbmap_auth(args)}",
-                                       f"{tag}/auth_smbmap.txt", "smbmap-auth")
+            # --no-write-check: skip smbmap's per-share write probe - it's slow
+            # on shares with lots of entries and leaves test files on target.
+            rc, out = await runner.run(f"smbmap -H {host} {smbmap_auth(args)} --no-write-check",
+                                       f"{tag}/auth_smbmap.txt", "smbmap-auth", timeout=90)
             scan_findings(out, "smb", 445, findings)
         if not nxc and not TOOLS.get("smbmap"):
             findings.append(Finding("MEDIUM", "smb", 445,
@@ -518,7 +520,8 @@ async def enum_smb(host, runner, args, findings):
         rc, out = await runner.run(f"smbclient -N -L //{host}/", f"{tag}/smbclient_list.txt", "smbclient")
         scan_findings(out, "smb", 445, findings)
     if TOOLS.get("smbmap"):
-        rc, out = await runner.run(f"smbmap -H {host} -u guest -p ''", f"{tag}/smbmap.txt", "smbmap")
+        rc, out = await runner.run(f"smbmap -H {host} -u guest -p '' --no-write-check",
+                                   f"{tag}/smbmap.txt", "smbmap", timeout=90)
         scan_findings(out, "smb", 445, findings)
     good("smb enum done")
 
@@ -669,14 +672,17 @@ async def enum_redis(host, port, runner, args, findings):
 
 async def enum_postgres(host, port, runner, args, findings):
     tag = f"{host}/postgres"
-    # 1) nmap NSE for version + brute-lite info
-    if TOOLS.get("nmap"):
+    nxc = nxc_bin()
+    # 1) nmap pgsql-brute: only as a fallback when nxc isn't around to do the
+    # same job faster. It brute-forces with nmap's full default word lists,
+    # so cap it with --script-timeout rather than letting it run to the enum
+    # timeout - it's opportunistic, not meant to complete.
+    if TOOLS.get("nmap") and not nxc:
         rc, out = await runner.run(
-            f"nmap -Pn -p {port} --script pgsql-brute -oN /dev/stdout {host}",
-            f"{tag}/pgsql_nse.txt", "nmap-pgsql", timeout=args.enum_timeout)
+            f"nmap -Pn -p {port} --script pgsql-brute --script-timeout 20s -oN /dev/stdout {host}",
+            f"{tag}/pgsql_nse.txt", "nmap-pgsql", timeout=45)
         scan_findings(out, "postgres", port, findings)
     # 2) netexec: use supplied creds if we have them, else default-cred sweep
-    nxc = nxc_bin()
     if nxc and have_creds(args):
         rc, out = await runner.run(f"{nxc} postgres {host} {nxc_auth(args)}",
                                    f"{tag}/auth_nxc.txt", f"{nxc}-postgres-auth")
