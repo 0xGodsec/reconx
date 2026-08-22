@@ -151,7 +151,7 @@ def refresh_tools():
               "smbclient", "rpcclient", "ldapsearch", "nbtscan",
               "snmpwalk", "onesixtyone", "showmount", "dig", "nslookup",
               "hydra", "ssh", "redis-cli", "psql", "openssl", "ncat", "nc",
-              "searchsploit", "nuclei",
+              "searchsploit",
               "impacket-GetUserSPNs", "GetUserSPNs.py",
               "impacket-GetNPUsers", "GetNPUsers.py"):
         TOOLS[t] = which(t)
@@ -280,7 +280,14 @@ class Runner:
 #  and a bounded worker pool draining a priority queue, not from every module
 #  being force-started together behind one phase barrier.
 # --------------------------------------------------------------------------- #
-PRIO_DISCOVER, PRIO_SCAN, PRIO_ENUM, PRIO_EXPLOIT, PRIO_BACKGROUND = 0, 1, 2, 3, 4
+PRIO_DISCOVER, PRIO_SCAN = 0, 1
+# 3-way split of the old flat PRIO_ENUM=2, so host-type-aware scheduling
+# (see classify_host_type/_service_priority) can weight one enum module
+# ahead of another without touching PRIO_EXPLOIT/PRIO_BACKGROUND's relative
+# order - only relative order matters anywhere these are used, so this
+# renumbering is safe.
+PRIO_ENUM_HIGH, PRIO_ENUM, PRIO_ENUM_LOW = 2, 3, 4
+PRIO_EXPLOIT, PRIO_BACKGROUND = 5, 6
 
 
 class Job:
@@ -374,7 +381,7 @@ class JobQueue:
     but never queued for execution - its coroutine is never entered at all.
 
     "Core" jobs (background=False) gate wait_core_done(); background jobs
-    (udp/nikto/nuclei/vuln-scan) run alongside everything else without
+    (udp/nikto/vuln-scan) run alongside everything else without
     blocking it. wait_all_done() waits for every job, core or background.
     """
 
@@ -400,7 +407,31 @@ class JobQueue:
         await asyncio.gather(*self._workers, return_exceptions=True)
 
     def add_job(self, job):
-        if job.id in self.jobs:
+        """Register a job, or - if this id is already known and still
+        queued (not yet picked up by a worker) - reprioritize it: decrease-
+        key via a duplicate heap entry. heapq always pops the numerically
+        smallest priority first regardless of insertion order, so whichever
+        entry currently matches job.priority (the single source of truth)
+        wins the race; _worker() discards any other, now-stale entry for
+        the same job on pop. This is what lets register_service_jobs()'s
+        confirm pass (better host-type info from nmap -sCV) correct a
+        still-queued job's priority from the earlier guess pass, with zero
+        change needed at either call site.
+
+        Also always refreshes coro_factory to the newest registration's
+        closure while still queued - the whole point of the confirm pass is
+        that it carries more accurate arguments (e.g. the real nmap-
+        confirmed service name instead of a port-guessed one), and a worker
+        reads job.coro_factory live at execution time, so this is enough to
+        make sure a reprioritized job actually runs with fresh data instead
+        of silently executing with the stale guess-pass closure."""
+        existing = self.jobs.get(job.id)
+        if existing is not None:
+            if existing.status == "queued":
+                existing.coro_factory = job.coro_factory
+                if existing.priority != job.priority:
+                    existing.priority = job.priority
+                    self._q.put_nowait((job.priority, next(self._seq), existing))
             return False
         self.jobs[job.id] = job
         if (self.state_store and not job.always_reenter
@@ -417,7 +448,12 @@ class JobQueue:
 
     async def _worker(self):
         while True:
-            _, _, job = await self._q.get()
+            priority, _, job = await self._q.get()
+            if job.status != "queued" or priority != job.priority:
+                # stale duplicate entry from a reprioritization, or the job
+                # already started/finished via its other entry - discard.
+                self._q.task_done()
+                continue
             job.status = "running"
             try:
                 await job.coro_factory()
@@ -676,6 +712,53 @@ def is_web(port, name):
     return port in WEB_PORTS or "http" in name.lower() or name.lower() in ("ssl/http", "http-alt")
 
 
+_AD_PORTS = {88, 389, 636, 3268, 3269, 464, 9389}
+_LINUX_PORTS = {22, 111, 2049}
+
+HOST_TYPE_LABELS = {
+    "ad": "Active Directory host",
+    "windows": "Windows host",
+    "linux": "Linux host",
+    "web": "web-focused host",
+}
+
+
+def classify_host_type(ports, services):
+    """Soft, single dominant archetype from open ports + (guessed or
+    confirmed) service names - drives enum priority weighting only, never
+    a hard branch: an 'ad'-classified host still gets its web ports
+    enumerated, just later. No extra scan needed - runs on whatever
+    discover_ports()/service_scan() already produced.
+
+    445/139 alone can't tell real Windows apart from Samba-on-Linux (any
+    Linux fileserver, most CTF/Metasploitable-style boxes) - confirmed
+    banner text is checked first and wins whenever it's available (i.e.
+    once nmap -sCV has run), with a bare-port fallback for the earlier
+    guess pass that only trusts genuinely Windows-exclusive ports."""
+    ports = set(ports)
+    names_blob = " ".join(
+        f"{(services.get(p, {}).get('name','') or '')} {(services.get(p, {}).get('version','') or '')}"
+        for p in ports).lower()
+
+    ad_hits = len(ports & _AD_PORTS)
+    if ad_hits >= 2 or (ad_hits >= 1 and (445 in ports or 139 in ports)):
+        return "ad"
+    if "samba" in names_blob:
+        return "linux"
+    if "windows" in names_blob:
+        return "windows"
+    if ports & {3389, 5985, 5986}:      # RDP/WinRM - essentially Windows-exclusive
+        return "windows"
+    if ports & _LINUX_PORTS:            # ssh/rpcbind/nfs - strong pre-banner Linux signal
+        return "linux"
+    if ports & {135, 139, 445}:         # SMB-only, no banner yet, no other signal - lean windows
+        return "windows"
+    web_ports = sum(1 for p in ports if is_web(p, (services.get(p, {}).get("name", "") or "")))
+    if web_ports and (len(ports) - web_ports) <= 1:
+        return "web"
+    return "unknown"
+
+
 # --------------------------------------------------------------------------- #
 #  Credentials - authenticated enumeration & spraying
 # --------------------------------------------------------------------------- #
@@ -833,28 +916,6 @@ async def enum_nikto(host, port, name, runner, args, findings):
                                f"{tag}/nikto.txt", "nikto", timeout=args.enum_timeout + 30)
     scan_findings(out, "http", port, findings)
     good(f"nikto done: {base}")
-
-
-_NUCLEI_SEV = {"info": "INFO", "low": "MEDIUM", "medium": "MEDIUM",
-               "high": "HIGH", "critical": "CRITICAL"}
-_NUCLEI_LINE_RX = re.compile(r"^\[[^\]]+\]\s*\[[^\]]+\]\s*\[(\w+)\]\s*(.+)$")
-
-
-async def enum_nuclei(host, port, name, runner, args, findings):
-    """Background job on web ports (--nuclei or --mode deep)."""
-    scheme, base, tag = _web_target(host, port, name)
-    if not TOOLS.get("nuclei"):
-        return
-    outfile = f"{tag}/nuclei.txt"
-    cmd = f"nuclei -u {base} -silent -o {os.path.join(runner.outdir, outfile)}"
-    rc, out = await runner.run(cmd, outfile, "nuclei",
-                               timeout=args.enum_timeout, managed_outfile=True)
-    for line in (out or "").splitlines():
-        m = _NUCLEI_LINE_RX.match(line.strip())
-        if m:
-            sev = _NUCLEI_SEV.get(m.group(1).lower(), "INFO")
-            findings.append(Finding(sev, "http", port, f"nuclei: {m.group(2).strip()}"))
-    good(f"nuclei done: {base}")
 
 
 async def enum_smb(host, runner, args, findings):
@@ -1267,6 +1328,32 @@ async def enum_rdp(host, port, runner, args, findings):
 
 
 # --------------------------------------------------------------------------- #
+#  Host-type-aware enum priority
+#
+#  Not in this table -> "unknown" host type -> every module falls back to
+#  flat PRIO_ENUM, i.e. today's behavior when classification can't say
+#  anything useful. A host-type entry only needs to list what it wants to
+#  pull FORWARD (PRIO_ENUM_HIGH) or push BACK (PRIO_ENUM_LOW) relative to
+#  that same default - this is a soft preference, not a hard gate: a
+#  LOW-priority module still runs on any worker that would otherwise sit
+#  idle, it just always loses the tie-break to a HIGH one.
+# --------------------------------------------------------------------------- #
+_HOST_TYPE_ENUM_PRIORITY = {
+    "ad": {"smb": PRIO_ENUM_HIGH, "ldap": PRIO_ENUM_HIGH, "dns": PRIO_ENUM_HIGH,
+           "winrm": PRIO_ENUM_HIGH, "web": PRIO_ENUM_LOW, "ftp": PRIO_ENUM_LOW,
+           "ssh": PRIO_ENUM_LOW},
+    "windows": {"smb": PRIO_ENUM_HIGH, "winrm": PRIO_ENUM_HIGH, "rdp": PRIO_ENUM_HIGH,
+                "web": PRIO_ENUM_LOW},
+    "linux": {"ssh": PRIO_ENUM_HIGH, "web": PRIO_ENUM_LOW, "mssql": PRIO_ENUM_LOW},
+    "web": {"web": PRIO_ENUM_HIGH},
+}
+
+
+def _service_priority(module_key, host_type):
+    return _HOST_TYPE_ENUM_PRIORITY.get(host_type, {}).get(module_key, PRIO_ENUM)
+
+
+# --------------------------------------------------------------------------- #
 #  Dispatcher: map discovered services -> queued jobs
 #
 #  Pure and idempotent: called TWICE per host - once right after port
@@ -1274,64 +1361,69 @@ async def enum_rdp(host, port, runner, args, findings):
 #  seconds, not after the full nmap -sCV pass across every port), and again
 #  once service_scan() confirms real versions. Job ids are deterministic, so
 #  a job the guess pass already registered is a harmless dedup no-op on the
-#  confirm pass; a job the guess pass missed (nmap corrects a wrong guess)
+#  confirm pass (except for priority - see JobQueue.add_job's decrease-key
+#  handling: the confirm pass's better host-type classification can still
+#  reprioritize a job the guess pass already queued, as long as it hasn't
+#  started yet); a job the guess pass missed (nmap corrects a wrong guess)
 #  still fires from the confirm pass, just later, without blocking anything.
 # --------------------------------------------------------------------------- #
 def register_service_jobs(queue, host, services, runner, args, findings, host_profile):
     counted = host_profile.setdefault("_counted_ports", set())
+    host_type = host_profile["host_type"] = classify_host_type(list(services), services)
+
+    def prio(module_key):
+        return _service_priority(module_key, host_type)
+
     for port, meta in sorted(services.items()):
         name = meta.get("name", guess_service(port))
 
         if is_web(port, name):
-            queue.add_job(Job(f"{host}:web:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:web:{port}", prio("web"), background=False,
                 coro_factory=functools.partial(enum_web, host, port, name, runner, args, findings)))
             if args.nikto:
                 queue.add_job(Job(f"{host}:nikto:{port}", PRIO_BACKGROUND, background=True,
                     coro_factory=functools.partial(enum_nikto, host, port, name, runner, args, findings)))
-            if args.nuclei:
-                queue.add_job(Job(f"{host}:nuclei:{port}", PRIO_BACKGROUND, background=True,
-                    coro_factory=functools.partial(enum_nuclei, host, port, name, runner, args, findings)))
         elif port in (139, 445) or "microsoft-ds" in name or "netbios" in name:
-            queue.add_job(Job(f"{host}:smb", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:smb", prio("smb"), background=False,
                 coro_factory=functools.partial(enum_smb, host, runner, args, findings)))
         elif port in (389, 636, 3268, 3269) or "ldap" in name:
-            queue.add_job(Job(f"{host}:ldap", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:ldap", prio("ldap"), background=False,
                 coro_factory=functools.partial(enum_ldap, host, port, runner, args, findings)))
         elif port == 21 or "ftp" in name:
-            queue.add_job(Job(f"{host}:ftp:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:ftp:{port}", prio("ftp"), background=False,
                 coro_factory=functools.partial(enum_ftp, host, port, runner, args, findings)))
         elif port == 22 or "ssh" in name:
-            queue.add_job(Job(f"{host}:ssh:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:ssh:{port}", prio("ssh"), background=False,
                 coro_factory=functools.partial(enum_ssh, host, port, runner, args, findings)))
         elif port == 25 or port in (465, 587) or "smtp" in name:
-            queue.add_job(Job(f"{host}:smtp:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:smtp:{port}", prio("smtp"), background=False,
                 coro_factory=functools.partial(enum_smtp, host, port, runner, args, findings)))
         elif port == 53 or "domain" in name or "dns" in name:
-            queue.add_job(Job(f"{host}:dns:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:dns:{port}", prio("dns"), background=False,
                 coro_factory=functools.partial(enum_dns, host, port, runner, args, findings)))
         elif port == 2049 or "nfs" in name:
-            queue.add_job(Job(f"{host}:nfs", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:nfs", prio("nfs"), background=False,
                 coro_factory=functools.partial(enum_nfs, host, runner, args, findings)))
         elif port == 1433 or "ms-sql" in name or "mssql" in name:
-            queue.add_job(Job(f"{host}:mssql:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:mssql:{port}", prio("mssql"), background=False,
                 coro_factory=functools.partial(enum_mssql, host, port, runner, args, findings)))
         elif port in (6379,) or "redis" in name:
-            queue.add_job(Job(f"{host}:redis:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:redis:{port}", prio("redis"), background=False,
                 coro_factory=functools.partial(enum_redis, host, port, runner, args, findings)))
         elif port == 5432 or "postgres" in name:
-            queue.add_job(Job(f"{host}:postgres:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:postgres:{port}", prio("postgres"), background=False,
                 coro_factory=functools.partial(enum_postgres, host, port, runner, args, findings)))
         elif port in (110, 995) or "pop3" in name:
-            queue.add_job(Job(f"{host}:pop3:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:pop3:{port}", prio("pop3"), background=False,
                 coro_factory=functools.partial(enum_pop3, host, port, runner, args, findings)))
         elif port in (143, 993) or "imap" in name:
-            queue.add_job(Job(f"{host}:imap:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:imap:{port}", prio("imap"), background=False,
                 coro_factory=functools.partial(enum_imap, host, port, runner, args, findings)))
         elif port in (5985, 5986) or "winrm" in name:
-            queue.add_job(Job(f"{host}:winrm:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:winrm:{port}", prio("winrm"), background=False,
                 coro_factory=functools.partial(enum_winrm, host, port, runner, args, findings)))
         elif port == 3389 or "ms-wbt" in name or "rdp" in name:
-            queue.add_job(Job(f"{host}:rdp:{port}", PRIO_ENUM, background=False,
+            queue.add_job(Job(f"{host}:rdp:{port}", prio("rdp"), background=False,
                 coro_factory=functools.partial(enum_rdp, host, port, runner, args, findings)))
 
         # profile hints - guarded per-port so the guess pass + confirm pass
@@ -1359,6 +1451,10 @@ def print_summary(host, services, udp, findings, host_profile, elapsed, args=Non
     if host_profile["dc_signals"] >= 2:
         print(f"  {C.M}{C.BOLD}HOST PROFILE:{C.END} likely {C.M}Active Directory Domain Controller{C.END} "
               f"- start with LDAP/Kerberos/SMB")
+    else:
+        label = HOST_TYPE_LABELS.get(host_profile.get("host_type"))
+        if label:
+            print(f"  {C.M}{C.BOLD}HOST PROFILE:{C.END} likely {C.M}{label}{C.END} - enum priority weighted accordingly")
     print()
 
     # open ports table
@@ -1439,6 +1535,10 @@ def write_markdown(host, services, udp, findings, outdir, host_profile):
         f.write(f"# recon notes - {host}\n\n_generated {datetime.now():%Y-%m-%d %H:%M}_\n\n")
         if host_profile["dc_signals"] >= 2:
             f.write("> **Host profile:** likely Active Directory Domain Controller.\n\n")
+        else:
+            label = HOST_TYPE_LABELS.get(host_profile.get("host_type"))
+            if label:
+                f.write(f"> **Host profile:** likely {label}.\n\n")
         f.write("## Open TCP ports\n\n| Port | Service | Version |\n|---|---|---|\n")
         for p in sorted(services):
             m = services[p]
@@ -1593,7 +1693,7 @@ async def scan_host(host, runner, args):
             good(f"notes written: {md}")
 
         if queue.had_background_jobs:
-            info("background modules (udp/nikto/nuclei/vuln-scan) still running - "
+            info("background modules (udp/nikto/vuln-scan) still running - "
                  "NOTES.md will be refreshed when they finish")
         await queue.wait_all_done()
         if not runner.dry_run and queue.had_background_jobs:
@@ -1707,14 +1807,13 @@ def build_argparser():
                     help="spray the ONE credential across all hosts (CIDR) via SMB/WinRM")
     p.add_argument("--mode", choices=("quick", "full", "deep"), default=None,
                    help="scan profile: quick (fast, no UDP/scripts), full (default), "
-                        "deep (bigger wordlist, nikto+nuclei+vuln-scripts auto-on)")
+                        "deep (bigger wordlist, nikto+vuln-scripts auto-on)")
     p.add_argument("--quick", action="store_true", help="top-1000 ports only (fast); shorthand for --mode quick")
     p.add_argument("--top-ports", type=int, help="scan only the top N common ports")
     p.add_argument("--no-udp", action="store_true", help="skip UDP scan")
     p.add_argument("--no-scripts", action="store_true", help="nmap -sV only, no -sC")
     p.add_argument("--no-rustscan", action="store_true", help="force built-in async scanner")
     p.add_argument("--nikto", action="store_true", help="run nikto on web ports (noisy, backgrounded)")
-    p.add_argument("--nuclei", action="store_true", help="run nuclei on web ports (backgrounded)")
     p.add_argument("--ping-sweep", action="store_true", help="liveness-check a CIDR first")
     p.add_argument("--wordlist", default=None,
                    help="dirbrute wordlist (default: auto-detect, mode-aware)")
@@ -1809,7 +1908,6 @@ def apply_mode_defaults(args):
         args.no_scripts = True
     elif args.mode == "deep":
         args.nikto = True
-        args.nuclei = True
         if args.version_intensity is None:
             args.version_intensity = 9
     return args.mode
@@ -1826,10 +1924,10 @@ async def amain(args):
     print(C.CY + BANNER + C.END)
     info(f"mode: {C.M}{args.mode}{C.END}  workers: {args.workers}  parallel: {args.parallel}")
     missing = [t for t in ("rustscan", "nmap", "feroxbuster", "gobuster", "whatweb",
-                           "enum4linux-ng", "nxc", "netexec", "nuclei") if not TOOLS.get(t)]
+                           "enum4linux-ng", "nxc", "netexec") if not TOOLS.get(t)]
     have = [t for t in ("rustscan", "nmap", "feroxbuster", "gobuster", "whatweb",
                         "enum4linux-ng", "nxc", "netexec", "smbclient", "ldapsearch",
-                        "snmpwalk", "curl", "nuclei") if TOOLS.get(t)]
+                        "snmpwalk", "curl") if TOOLS.get(t)]
     info(f"tools available: {C.G}{', '.join(have) or 'none'}{C.END}")
     if missing:
         warn(f"missing (modules will degrade/skip): {C.DIM}{', '.join(missing)}{C.END}")
