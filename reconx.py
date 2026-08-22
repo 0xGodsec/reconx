@@ -33,8 +33,10 @@ Author: built with OffSec-OS (OSCP mentor). MIT-style, hack freely.
 import argparse
 import asyncio
 import ipaddress
+import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -105,7 +107,8 @@ def refresh_tools():
               "curl", "enum4linux-ng", "enum4linux", "nxc", "netexec", "crackmapexec",
               "smbclient", "smbmap", "rpcclient", "ldapsearch", "nbtscan",
               "snmpwalk", "onesixtyone", "showmount", "dig", "nslookup",
-              "hydra", "ssh", "redis-cli", "psql", "openssl", "ncat", "nc"):
+              "hydra", "ssh", "redis-cli", "psql", "openssl", "ncat", "nc",
+              "searchsploit"):
         TOOLS[t] = which(t)
 
 
@@ -113,20 +116,37 @@ def refresh_tools():
 #  Command runner
 # --------------------------------------------------------------------------- #
 class Runner:
-    def __init__(self, outdir, dry_run=False, timeout=900, verbose=False):
+    def __init__(self, outdir, dry_run=False, timeout=900, verbose=False, resume=False):
         self.outdir = outdir
         self.dry_run = dry_run
         self.timeout = timeout
         self.verbose = verbose
+        self.resume = resume
         self.plan = []          # for --dry-run
         self.sem = None         # set once loop exists
 
-    async def run(self, cmd, outfile=None, label=None, timeout=None):
-        """Run a shell command, tee output to a file, return (rc, stdout+stderr)."""
+    async def run(self, cmd, outfile=None, label=None, timeout=None, managed_outfile=False):
+        """Run a shell command, tee output to a file, return (rc, stdout+stderr).
+
+        managed_outfile=True means cmd itself writes to `outfile` (e.g.
+        feroxbuster's own -o flag) rather than us capturing stdout - we only
+        use `outfile` for --resume detection and to recover output if stdout
+        was empty, and never overwrite what the command wrote."""
         label = label or cmd.split()[0]
         if self.dry_run:
             self.plan.append((label, cmd, outfile))
             return 0, ""
+        if self.resume and outfile:
+            path = os.path.join(self.outdir, outfile)
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                if self.verbose:
+                    info(f"resume: {C.DIM}skipping {label}, using cached {path}{C.END}")
+                with open(path, errors="replace") as f:
+                    cached = f.read()
+                # strip the "# cmd: ...\n\n" header we write below, if present
+                if not managed_outfile and cached.startswith("# cmd:") and "\n\n" in cached:
+                    cached = cached.split("\n\n", 1)[1]
+                return 0, cached
         async with self.sem:
             if self.verbose:
                 info(f"run: {C.DIM}{cmd}{C.END}")
@@ -151,11 +171,17 @@ class Runner:
                     warn(f"timeout ({label}) after {timeout or self.timeout}s")
                     return 124, ""
                 text = out.decode(errors="replace") if out else ""
-                if outfile:
+                if outfile and not managed_outfile:
                     path = os.path.join(self.outdir, outfile)
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                     with open(path, "w", errors="replace") as f:
                         f.write(f"# cmd: {cmd}\n\n{text}")
+                elif managed_outfile and not text:
+                    # cmd's own -o file is the only place its results landed
+                    path = os.path.join(self.outdir, outfile)
+                    if os.path.isfile(path):
+                        with open(path, errors="replace") as f:
+                            text = f.read()
                 return proc.returncode, text
             except FileNotFoundError:
                 bad(f"command not found: {cmd.split()[0]}")
@@ -287,6 +313,73 @@ async def banner_fallback(host, ports):
     return services
 
 
+# --------------------------------------------------------------------------- #
+#  Exploit-DB lookups for detected service versions
+# --------------------------------------------------------------------------- #
+# words too generic/decorative to be trustworthy exploit-db search terms on
+# their own (org acronyms, protocol/transport words, banner filler) - a bare
+# hit on one of these is noise, not a real correlation (e.g. 'ISC 9.4.2' from
+# 'ISC BIND 9.4.2' matches unrelated Cisco/Avast CVEs by version-range fluke).
+_SEARCHSPLOIT_TOO_GENERIC = {
+    "isc", "db", "ip", "ns", "gnu", "www", "ftp", "ssh", "http", "https",
+    "dns", "tcp", "udp", "smb", "sql", "protocol", "engine", "jsp", "org", "v1",
+}
+
+
+def _searchsploit_terms(version):
+    """Build candidate searchsploit query terms from an nmap version string,
+    most specific first, e.g. 'Samba smbd 3.0.20-Debian' -> ['Samba smbd
+    3.0.20', 'Samba 3.0.20']. nmap's product name doesn't always match
+    exploit-db's naming (extra words like 'httpd'/'smbd' break AND-matching),
+    so a clean two-word 'vendor product' name also gets tried word-by-word.
+    Longer name phrases are left as just the full-phrase attempt: when nmap's
+    version field puts several words between the product name and the number
+    (e.g. 'Apache Tomcat/Coyote JSP engine 1.1', where 1.1 is the JSP spec
+    version, not Apache's), that number likely doesn't belong to the first
+    word at all, so guessing single-word fallbacks there does more harm
+    (wrong product) than good."""
+    m = re.match(r"^(.*?)\s+((?:\d+\.){1,3}\d+[A-Za-z0-9]*)", version or "")
+    if not m:
+        return []
+    name_part, ver = m.group(1).strip(), m.group(2)
+    words = name_part.split()
+    terms = [f"{name_part} {ver}"]
+    if len(words) == 2:
+        for w in (words[0], words[-1]):
+            w = re.sub(r"[^A-Za-z0-9]", "", w)
+            if w and w.lower() not in _SEARCHSPLOIT_TOO_GENERIC:
+                terms.append(f"{w} {ver}")
+    return terms
+
+
+async def searchsploit_lookup(host, services, runner, args, findings):
+    """Best-effort exploit-db correlation for each detected service version.
+    Opportunistic: a version banner that doesn't cleanly map to exploit-db's
+    naming just yields no results rather than a false positive."""
+    if args.no_exploit_search or not TOOLS.get("searchsploit"):
+        return
+
+    async def check(port, meta):
+        for term in _searchsploit_terms(meta.get("version", "")):
+            rc, out = await runner.run(f"searchsploit -j {shlex.quote(term)}",
+                                       None, "searchsploit", timeout=20)
+            if runner.dry_run or not out:
+                continue
+            try:
+                data = json.loads(out)
+            except ValueError:
+                continue
+            hits = data.get("RESULTS_EXPLOIT") or []
+            if hits:
+                titles = "; ".join(h.get("Title", "?") for h in hits[:3])
+                more = f" (+{len(hits) - 3} more)" if len(hits) > 3 else ""
+                findings.append(Finding("MEDIUM", "exploit", port,
+                    f"searchsploit hit for '{term}': {titles}{more} - verify before use"))
+                return  # most-specific successful term wins; don't re-search broader terms
+
+    await asyncio.gather(*(check(p, m) for p, m in services.items()))
+
+
 async def udp_scan(host, runner, args):
     if args.no_udp or not TOOLS.get("nmap"):
         return {}
@@ -396,7 +489,10 @@ FINDING_RULES = [
     ("HIGH",     re.compile(r"defaultNamingContext:|rootDomainNamingContext:", re.I), "ldap", "LDAP leaks naming context (domain structure)"),
     ("HIGH",     re.compile(r"(Domain Controller|DC=.*,DC=|ldap.*Kerberos)", re.I), "ad", "Host looks like a Domain Controller"),
     ("MEDIUM",   re.compile(r"Kerberos.*88/tcp open", re.I), "kerberos", "Kerberos exposed - try user enum / AS-REP roasting"),
-    ("HIGH",     re.compile(r"\b(admin|password|root|toor|user|guest|sa)\b\s*[:/]\s*\b\w+\b", re.I), "creds", "Possible default/leaked credential in output"),
+    # requires an explicit credential-assignment keyword + ':'/'=' + a value,
+    # not just two words separated by punctuation (that matched web paths
+    # like "admin/config" and any "word: word" text as false positives).
+    ("HIGH",     re.compile(r"(?:^|[^a-zA-Z0-9])(password|passwd|pwd|secret|api[_-]?key|access[_-]?token)['\"]?\s*[:=]\s*['\"]?\S{3,}", re.I), "creds", "Possible default/leaked credential in output"),
     ("MEDIUM",   re.compile(r"robots\.txt", re.I), "http", "robots.txt present - inspect disallowed paths"),
     ("HIGH",     re.compile(r"(phpmyadmin|/admin|wp-login|wp-admin|/manager/html|jenkins|gitlab|/api|/backup)", re.I), "http", "Interesting web path discovered"),
     ("HIGH",     re.compile(r"(Apache Tomcat|Jenkins|GitLab|WordPress|Drupal|Joomla)[\s/]*([\d.]+)?", re.I), "http", "Notable web application detected"),
@@ -463,7 +559,8 @@ async def enum_web(host, port, name, runner, args, findings):
     elif TOOLS.get("feroxbuster"):
         cmd = (f"feroxbuster -u {base} -w {wl} -t 50 -q --no-recursion "
                f"-s 200,204,301,302,307,401,403 -o {os.path.join(runner.outdir, tag, 'ferox.txt')}")
-        rc, out = await runner.run(cmd, None, "feroxbuster", timeout=args.enum_timeout)
+        rc, out = await runner.run(cmd, f"{tag}/ferox.txt", "feroxbuster",
+                                   timeout=args.enum_timeout, managed_outfile=True)
         scan_findings(out, "http", port, findings)
     elif TOOLS.get("gobuster"):
         cmd = f"gobuster dir -u {base} -w {wl} -t 50 -q -k"
@@ -998,8 +1095,11 @@ async def scan_host(host, runner, args):
         udp_scan(host, runner, args),
     )
 
-    # enumerate services concurrently
-    await dispatch(host, services, runner, args, findings, host_profile)
+    # enumerate services concurrently, alongside exploit-db correlation
+    await asyncio.gather(
+        dispatch(host, services, runner, args, findings, host_profile),
+        searchsploit_lookup(host, services, runner, args, findings),
+    )
 
     elapsed = time.time() - t0
     if not runner.dry_run:
@@ -1127,6 +1227,10 @@ def build_argparser():
     p.add_argument("--enum-timeout", type=int, default=600, help="per-enum-module timeout (s)")
     p.add_argument("--timeout", type=int, default=900, help="default command timeout (s)")
     p.add_argument("--dry-run", action="store_true", help="print the command plan, run nothing")
+    p.add_argument("--resume", action="store_true",
+                   help="skip commands whose output file already exists in outdir (resume an interrupted run)")
+    p.add_argument("--no-exploit-search", action="store_true",
+                   help="skip searchsploit lookups for detected service versions")
     p.add_argument("-v", "--verbose", action="store_true", help="print every command as it runs")
     p.add_argument("--no-color", action="store_true", help="disable coloured output")
     return p
@@ -1177,7 +1281,7 @@ async def amain(args):
     refresh_tools()
     resolve_wordlist(args)
     runner = Runner(args.outdir, dry_run=args.dry_run,
-                    timeout=args.timeout, verbose=args.verbose)
+                    timeout=args.timeout, verbose=args.verbose, resume=args.resume)
     runner.sem = asyncio.Semaphore(args.parallel)
 
     print(C.CY + BANNER + C.END)
