@@ -24,7 +24,7 @@ you'd run anyway, in parallel — you still do the thinking.
 - Python 3.8+ (standard library only — nothing to `pip install`)
 - Optional external tools (each degrades gracefully if absent):
   `rustscan`, `nmap`, `feroxbuster`/`gobuster`, `whatweb`, `nikto`,
-  `enum4linux-ng`, `nxc`/`netexec`, `smbclient`, `smbmap`, `rpcclient`,
+  `enum4linux-ng`, `nxc`/`netexec`, `smbclient`, `rpcclient`,
   `ldapsearch`, `snmpwalk`, `onesixtyone`, `showmount`, `dig`, `curl`, `redis-cli`
 
 On Kali these are mostly preinstalled. reconx prints which it found and which it's skipping.
@@ -73,7 +73,7 @@ Credential flags: `-u/--user`, `-p/--pass`, `-H/--hash` (NTLM PtH),
    with a top-100 UDP scan in parallel.
 3. **Targeted enumeration** — dispatches per-service modules concurrently:
    - **Web** (80/443/8080/…): whatweb, robots.txt, feroxbuster/gobuster, opt nikto
-   - **SMB/AD** (139/445/389/88): netexec shares+users, enum4linux-ng, smbclient/smbmap, ldapsearch anon dump, DC detection
+   - **SMB/AD** (139/445/389/88): netexec shares+users, enum4linux-ng, smbclient, ldapsearch anon dump, DC detection
    - **Remote access** (21/22/23/3389/5985): FTP anon, SSH NSE, RDP NTLM info, WinRM note
    - **DB & misc** (1433/5432/6379/161/25/53/2049): MSSQL, **PostgreSQL** (default-cred sweep + psql probe), Redis, SNMP walk, SMTP user-enum, NFS exports, DNS
    - **Mail** (110/995 POP3, 143/993 IMAP): NSE capabilities + banner/CAPABILITY grab (TLS-aware via openssl), cred-reuse hints
@@ -89,7 +89,7 @@ reconx-results/
 └── 10.10.10.10/
     ├── scans/        rustscan, nmap service, nmap udp
     ├── web_80/       whatweb, headers, robots, ferox/gobuster, nikto
-    ├── smb/          netexec, enum4linux-ng, smbclient, smbmap
+    ├── smb/          netexec, enum4linux-ng, smbclient
     ├── ldap/         rootdse, anon dump
     ├── ftp/ ssh/ snmp/ nfs/ ...
     └── NOTES.md      ports table + ranked findings, ready for your notes

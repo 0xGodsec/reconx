@@ -32,7 +32,9 @@ Author: built with OffSec-OS (OSCP mentor). MIT-style, hack freely.
 
 import argparse
 import asyncio
+import functools
 import ipaddress
+import itertools
 import json
 import os
 import re
@@ -94,6 +96,47 @@ class Finding:
         return f"[{self.sev}] {self.service}{p} - {self.text}"
 
 
+def _print_live_finding(f):
+    col = SEV_COLOR.get(f.sev, "")
+    p = f":{f.port}" if f.port else ""
+    print(f"{C.GR}[{ts()}]{C.END} {col}[{f.sev}]{C.END} {C.DIM}{f.service}{p}{C.END}  {f.text}")
+
+
+class FindingsList(list):
+    """A list of Finding that prints each *new* one live as it's appended,
+    instead of only ever surfacing findings in the final summary. De-duped
+    on the same (sev, service, port, text) key print_summary/write_markdown
+    already use, so re-registering the same job (guess pass + confirm pass)
+    or a rerun rule never double-prints. Optionally persists new findings to
+    a StateStore so a job that's skipped on --resume (because it already
+    completed in an earlier, interrupted run) doesn't silently vanish from
+    NOTES.md - findings, unlike command output, only ever live in memory
+    otherwise."""
+
+    def __init__(self, *a, state_store=None, **kw):
+        super().__init__(*a, **kw)
+        self._seen = set()
+        self._state_store = state_store
+
+    def append(self, finding):
+        key = (finding.sev, finding.service, finding.port, finding.text)
+        if key in self._seen:
+            return
+        super().append(finding)
+        self._seen.add(key)
+        _print_live_finding(finding)
+        if self._state_store:
+            self._state_store.record_finding(finding)
+
+    def seed(self, finding):
+        """Add a finding restored from persisted state, without a live
+        reprint or re-recording it - it's already in the state file."""
+        key = (finding.sev, finding.service, finding.port, finding.text)
+        if key not in self._seen:
+            super().append(finding)
+            self._seen.add(key)
+
+
 # --------------------------------------------------------------------------- #
 #  Tool availability (graceful degradation)
 # --------------------------------------------------------------------------- #
@@ -105,10 +148,12 @@ TOOLS = {}
 def refresh_tools():
     for t in ("rustscan", "nmap", "whatweb", "feroxbuster", "gobuster", "nikto",
               "curl", "enum4linux-ng", "enum4linux", "nxc", "netexec", "crackmapexec",
-              "smbclient", "smbmap", "rpcclient", "ldapsearch", "nbtscan",
+              "smbclient", "rpcclient", "ldapsearch", "nbtscan",
               "snmpwalk", "onesixtyone", "showmount", "dig", "nslookup",
               "hydra", "ssh", "redis-cli", "psql", "openssl", "ncat", "nc",
-              "searchsploit"):
+              "searchsploit", "nuclei",
+              "impacket-GetUserSPNs", "GetUserSPNs.py",
+              "impacket-GetNPUsers", "GetNPUsers.py"):
         TOOLS[t] = which(t)
 
 
@@ -139,14 +184,44 @@ class Runner:
         if self.resume and outfile:
             path = os.path.join(self.outdir, outfile)
             if os.path.isfile(path) and os.path.getsize(path) > 0:
+                stale = False
+                cached = None
+                if not managed_outfile:
+                    with open(path, errors="replace") as f:
+                        cached = f.read()
+                    # strip the "# cmd: ...\n\n" header we write below, if present,
+                    # and use it to detect a changed command (e.g. --mode/--wordlist
+                    # changed since the cached file was written) rather than
+                    # blindly trusting whatever's on disk at this path.
+                    if cached.startswith("# cmd:") and "\n\n" in cached:
+                        header, rest = cached.split("\n\n", 1)
+                        if header[len("# cmd: "):] != cmd:
+                            stale = True
+                        cached = rest
+                else:
+                    # managed-outfile tools (feroxbuster -o, ...) don't write a
+                    # header themselves, so we keep a small sidecar recording
+                    # the command that produced them. A missing sidecar means
+                    # an older reconx wrote this file - trust the cache rather
+                    # than treat pre-existing loot as stale.
+                    meta_path = path + ".reconx-meta.json"
+                    if os.path.isfile(meta_path):
+                        try:
+                            with open(meta_path) as f:
+                                meta = json.load(f)
+                            if meta.get("cmd") != cmd:
+                                stale = True
+                        except (ValueError, OSError):
+                            pass
+                if not stale:
+                    if self.verbose:
+                        info(f"resume: {C.DIM}skipping {label}, using cached {path}{C.END}")
+                    if managed_outfile:
+                        with open(path, errors="replace") as f:
+                            cached = f.read()
+                    return 0, cached
                 if self.verbose:
-                    info(f"resume: {C.DIM}skipping {label}, using cached {path}{C.END}")
-                with open(path, errors="replace") as f:
-                    cached = f.read()
-                # strip the "# cmd: ...\n\n" header we write below, if present
-                if not managed_outfile and cached.startswith("# cmd:") and "\n\n" in cached:
-                    cached = cached.split("\n\n", 1)[1]
-                return 0, cached
+                    info(f"resume: {C.DIM}cached {path} is from a different command, re-running {label}{C.END}")
         async with self.sem:
             if self.verbose:
                 info(f"run: {C.DIM}{cmd}{C.END}")
@@ -162,7 +237,7 @@ class Runner:
                         proc.communicate(), timeout=timeout or self.timeout)
                 except asyncio.TimeoutError:
                     # cmd runs via a shell, so proc.kill() would only kill the
-                    # shell - tools that fork workers (smbmap, ferox, ...) keep
+                    # shell - tools that fork workers (ferox, enum4linux-ng, ...) keep
                     # running. Kill the whole process group instead.
                     try:
                         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -176,16 +251,196 @@ class Runner:
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                     with open(path, "w", errors="replace") as f:
                         f.write(f"# cmd: {cmd}\n\n{text}")
-                elif managed_outfile and not text:
-                    # cmd's own -o file is the only place its results landed
+                elif managed_outfile:
                     path = os.path.join(self.outdir, outfile)
-                    if os.path.isfile(path):
+                    if not text and os.path.isfile(path):
+                        # cmd's own -o file is the only place its results landed
                         with open(path, errors="replace") as f:
                             text = f.read()
+                    if os.path.isfile(path):
+                        try:
+                            with open(path + ".reconx-meta.json", "w") as f:
+                                json.dump({"cmd": cmd}, f)
+                        except OSError:
+                            pass
                 return proc.returncode, text
             except FileNotFoundError:
                 bad(f"command not found: {cmd.split()[0]}")
                 return 127, ""
+
+
+# --------------------------------------------------------------------------- #
+#  Priority job queue - the scan engine
+#
+#  Every job is only ever registered by code that runs *after* awaiting its
+#  own prerequisite (e.g. a service-enum job is added from inside the
+#  coroutine that just discovered the port), so a job is always runnable the
+#  instant it's added - there's no separate dependency graph to resolve.
+#  Concurrency and "only run what's relevant" come from WHEN jobs get added
+#  and a bounded worker pool draining a priority queue, not from every module
+#  being force-started together behind one phase barrier.
+# --------------------------------------------------------------------------- #
+PRIO_DISCOVER, PRIO_SCAN, PRIO_ENUM, PRIO_EXPLOIT, PRIO_BACKGROUND = 0, 1, 2, 3, 4
+
+
+class Job:
+    __slots__ = ("id", "priority", "background", "coro_factory", "status", "always_reenter")
+
+    def __init__(self, id, priority, coro_factory, background=False, always_reenter=False):
+        self.id = id
+        self.priority = priority
+        self.coro_factory = coro_factory
+        self.background = background
+        self.status = "queued"
+        # True for orchestrator jobs (discover/service_scan) whose coroutine
+        # body has a side effect - registering follow-up jobs - beyond just
+        # "did the work", so it must always be entered even when the state
+        # store says "done". Their own bodies still skip the real work and
+        # reuse cached ports/services; leaf enum_* jobs don't need this and
+        # get the full skip-without-reentering benefit on resume.
+        self.always_reenter = always_reenter
+
+
+class StateStore:
+    """Persists <outdir>/<host>/.reconx_state.json so an interrupted scan can
+    resume without re-orchestrating every module from scratch. Only "done"/
+    "failed" job statuses are ever written - a job mid-flight at crash time
+    simply has no entry, so "absent -> not done -> re-run" falls out for free
+    without a separate stale "running" state to worry about."""
+
+    def __init__(self, outdir, host):
+        self.path = os.path.join(outdir, host, ".reconx_state.json")
+        self.data = {"target": host, "mode": None, "started_at": None,
+                     "ports": [], "services": {}, "udp": {}, "jobs": {}, "findings": []}
+        self._lock = asyncio.Lock()
+
+    def load(self):
+        if os.path.isfile(self.path):
+            try:
+                with open(self.path) as f:
+                    on_disk = json.load(f)
+                on_disk["services"] = {int(k): v for k, v in on_disk.get("services", {}).items()}
+                self.data.update(on_disk)
+            except (ValueError, OSError, TypeError) as e:
+                warn(f"state file unreadable, ignoring ({e}): {self.path}")
+        return self.data
+
+    def job_status(self, job_id):
+        return self.data.get("jobs", {}).get(job_id, {}).get("status")
+
+    async def mark_job(self, job_id, status):
+        async with self._lock:
+            self.data["jobs"][job_id] = {
+                "status": status,
+                "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self._flush()
+
+    def record_finding(self, finding):
+        """Synchronous and lock-free by design: called from FindingsList.append(),
+        which - like add_job() - never awaits, so it can't be interleaved with
+        another coroutine on this single-threaded event loop."""
+        entry = [finding.sev, finding.service, finding.port, finding.text]
+        findings = self.data.setdefault("findings", [])
+        if entry not in findings:
+            findings.append(entry)
+            self._flush()
+
+    async def save_ports_services(self, ports=None, services=None, udp=None):
+        async with self._lock:
+            if ports is not None:
+                self.data["ports"] = ports
+            if services is not None:
+                self.data["services"] = services
+            if udp is not None:
+                self.data["udp"] = udp
+            self._flush()
+
+    def _flush(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = f"{self.path}.tmp.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(self.data, f, indent=2, default=str)
+        os.replace(tmp, self.path)  # atomic - no torn JSON on crash
+
+
+class JobQueue:
+    """Priority-ordered, bounded-worker-pool job runner.
+
+    add_job() is synchronous (no `await` inside) so the dedup check-then-
+    insert is atomic under cooperative scheduling - two coroutines racing to
+    register the same job id can never both win. A job already marked "done"
+    in a resumed StateStore is accepted into .jobs (for bookkeeping/back-refs)
+    but never queued for execution - its coroutine is never entered at all.
+
+    "Core" jobs (background=False) gate wait_core_done(); background jobs
+    (udp/nikto/nuclei/vuln-scan) run alongside everything else without
+    blocking it. wait_all_done() waits for every job, core or background.
+    """
+
+    def __init__(self, workers=8, state_store=None):
+        self._q = asyncio.PriorityQueue()
+        self._seq = itertools.count()  # heapq tie-break: Job isn't orderable
+        self.jobs = {}
+        self.state_store = state_store
+        self._core_inflight = 0
+        self._core_done = asyncio.Event()
+        self._core_done.set()
+        self._nworkers = workers
+        self._workers = []
+        self.had_background_jobs = False
+
+    async def __aenter__(self):
+        self._workers = [asyncio.create_task(self._worker()) for _ in range(self._nworkers)]
+        return self
+
+    async def __aexit__(self, *exc):
+        for w in self._workers:
+            w.cancel()
+        await asyncio.gather(*self._workers, return_exceptions=True)
+
+    def add_job(self, job):
+        if job.id in self.jobs:
+            return False
+        self.jobs[job.id] = job
+        if (self.state_store and not job.always_reenter
+                and self.state_store.job_status(job.id) == "done"):
+            job.status = "done"  # resumed: trust it, never enter the coroutine
+            return False
+        if job.background:
+            self.had_background_jobs = True
+        else:
+            self._core_inflight += 1
+            self._core_done.clear()
+        self._q.put_nowait((job.priority, next(self._seq), job))
+        return True
+
+    async def _worker(self):
+        while True:
+            _, _, job = await self._q.get()
+            job.status = "running"
+            try:
+                await job.coro_factory()
+                job.status = "done"
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                job.status = "failed"
+                bad(f"job '{job.id}' failed: {e}")
+            finally:
+                if self.state_store and job.status in ("done", "failed"):
+                    await self.state_store.mark_job(job.id, job.status)
+                if not job.background:
+                    self._core_inflight -= 1
+                    if self._core_inflight <= 0:
+                        self._core_done.set()
+                self._q.task_done()
+
+    async def wait_core_done(self):
+        await self._core_done.wait()
+
+    async def wait_all_done(self):
+        await self._q.join()
 
 
 # --------------------------------------------------------------------------- #
@@ -292,7 +547,8 @@ async def service_scan(host, ports, runner, args):
 
     plist = ",".join(str(p) for p in ports)
     scripts = "" if args.no_scripts else "-sC"
-    cmd = (f"nmap -Pn -sV {scripts} -p {plist} --version-intensity 6 "
+    intensity = getattr(args, "version_intensity", None) or 6
+    cmd = (f"nmap -Pn -sV {scripts} -p {plist} --version-intensity {intensity} "
            f"-oN /dev/stdout {host}")
     info(f"service/version detection on {len(ports)} port(s) via nmap -sCV")
     rc, out = await runner.run(cmd, outfile=f"{host}/scans/nmap_service.txt",
@@ -461,17 +717,6 @@ def cred_label(args):
     return f"{who}:{secret} ({scope})"
 
 
-def smbmap_auth(args):
-    parts = [f"-u {_sh_quote(args.user)}"]
-    if getattr(args, "hash", None):
-        parts.append(f"-p {_sh_quote(args.hash)}")   # smbmap accepts LM:NT or NT hash via -p
-    else:
-        parts.append(f"-p {_sh_quote(args.password)}")
-    if getattr(args, "domain", None):
-        parts.append(f"-d {_sh_quote(args.domain)}")
-    return " ".join(parts)
-
-
 # --------------------------------------------------------------------------- #
 #  Findings engine - regex rules over tool output
 # --------------------------------------------------------------------------- #
@@ -533,10 +778,15 @@ def scan_findings(text, default_service, port, findings):
 # --------------------------------------------------------------------------- #
 #  Enumeration modules - each returns nothing, appends to findings list
 # --------------------------------------------------------------------------- #
-async def enum_web(host, port, name, runner, args, findings):
+def _web_target(host, port, name):
     scheme = "https" if (port in (443, 8443, 5986) or "https" in name or "ssl" in name) else "http"
     base = f"{scheme}://{host}:{port}"
     tag = f"{host}/web_{port}"
+    return scheme, base, tag
+
+
+async def enum_web(host, port, name, runner, args, findings):
+    scheme, base, tag = _web_target(host, port, name)
 
     # whatweb / curl headers
     if TOOLS.get("whatweb"):
@@ -557,7 +807,8 @@ async def enum_web(host, port, name, runner, args, findings):
     if not wl:
         pass
     elif TOOLS.get("feroxbuster"):
-        cmd = (f"feroxbuster -u {base} -w {wl} -t 50 -q --no-recursion "
+        recurse = "" if getattr(args, "mode", None) == "deep" else "--no-recursion"
+        cmd = (f"feroxbuster -u {base} -w {wl} -t 50 -q {recurse} "
                f"-s 200,204,301,302,307,401,403 -o {os.path.join(runner.outdir, tag, 'ferox.txt')}")
         rc, out = await runner.run(cmd, f"{tag}/ferox.txt", "feroxbuster",
                                    timeout=args.enum_timeout, managed_outfile=True)
@@ -569,13 +820,41 @@ async def enum_web(host, port, name, runner, args, findings):
     else:
         warn(f"no feroxbuster/gobuster - skipping dirbrute on {base}")
 
-    # nikto (optional; noisy)
-    if args.nikto and TOOLS.get("nikto"):
-        rc, out = await runner.run(f"nikto -host {base} -maxtime {args.enum_timeout}s",
-                                   f"{tag}/nikto.txt", "nikto", timeout=args.enum_timeout + 30)
-        scan_findings(out, "http", port, findings)
-
     good(f"web enum done: {base}")
+
+
+async def enum_nikto(host, port, name, runner, args, findings):
+    """Runs standalone as a background job so it never delays whatweb/
+    dirbrute/robots.txt findings behind its own slow scan."""
+    scheme, base, tag = _web_target(host, port, name)
+    if not TOOLS.get("nikto"):
+        return
+    rc, out = await runner.run(f"nikto -host {base} -maxtime {args.enum_timeout}s",
+                               f"{tag}/nikto.txt", "nikto", timeout=args.enum_timeout + 30)
+    scan_findings(out, "http", port, findings)
+    good(f"nikto done: {base}")
+
+
+_NUCLEI_SEV = {"info": "INFO", "low": "MEDIUM", "medium": "MEDIUM",
+               "high": "HIGH", "critical": "CRITICAL"}
+_NUCLEI_LINE_RX = re.compile(r"^\[[^\]]+\]\s*\[[^\]]+\]\s*\[(\w+)\]\s*(.+)$")
+
+
+async def enum_nuclei(host, port, name, runner, args, findings):
+    """Background job on web ports (--nuclei or --mode deep)."""
+    scheme, base, tag = _web_target(host, port, name)
+    if not TOOLS.get("nuclei"):
+        return
+    outfile = f"{tag}/nuclei.txt"
+    cmd = f"nuclei -u {base} -silent -o {os.path.join(runner.outdir, outfile)}"
+    rc, out = await runner.run(cmd, outfile, "nuclei",
+                               timeout=args.enum_timeout, managed_outfile=True)
+    for line in (out or "").splitlines():
+        m = _NUCLEI_LINE_RX.match(line.strip())
+        if m:
+            sev = _NUCLEI_SEV.get(m.group(1).lower(), "INFO")
+            findings.append(Finding(sev, "http", port, f"nuclei: {m.group(2).strip()}"))
+    good(f"nuclei done: {base}")
 
 
 async def enum_smb(host, runner, args, findings):
@@ -583,23 +862,15 @@ async def enum_smb(host, runner, args, findings):
     nxc = nxc_bin()
     if have_creds(args):
         # authenticated: check access, admin (Pwn3d!), shares, users, and loot.
-        # nxc and smbmap are independent here - a missing nxc should not silently
-        # skip the smbmap-based authenticated check (and vice versa).
         if nxc:
             auth = nxc_auth(args)
             for sub in ("--shares", "--users", "--pass-pol", "--loggedon-users", "--sam"):
                 rc, out = await runner.run(f"{nxc} smb {host} {auth} {sub}",
                                            f"{tag}/auth_nxc{sub.replace('-','')}.txt", f"{nxc} smb {sub}")
                 scan_findings(out, "smb", 445, findings)
-        if TOOLS.get("smbmap"):
-            # --no-write-check: skip smbmap's per-share write probe - it's slow
-            # on shares with lots of entries and leaves test files on target.
-            rc, out = await runner.run(f"smbmap -H {host} {smbmap_auth(args)} --no-write-check",
-                                       f"{tag}/auth_smbmap.txt", "smbmap-auth", timeout=90)
-            scan_findings(out, "smb", 445, findings)
-        if not nxc and not TOOLS.get("smbmap"):
+        else:
             findings.append(Finding("MEDIUM", "smb", 445,
-                "Creds supplied but no netexec/nxc or smbmap found - authenticated SMB untested"))
+                "Creds supplied but no netexec/nxc found - authenticated SMB untested"))
     elif nxc:
         for sub in ("--shares", "--users", "--pass-pol"):
             rc, out = await runner.run(f"{nxc} smb {host} -u '' -p '' {sub}",
@@ -616,15 +887,92 @@ async def enum_smb(host, runner, args, findings):
     if TOOLS.get("smbclient"):
         rc, out = await runner.run(f"smbclient -N -L //{host}/", f"{tag}/smbclient_list.txt", "smbclient")
         scan_findings(out, "smb", 445, findings)
-    if TOOLS.get("smbmap"):
-        rc, out = await runner.run(f"smbmap -H {host} -u guest -p '' --no-write-check",
-                                   f"{tag}/smbmap.txt", "smbmap", timeout=90)
-        scan_findings(out, "smb", 445, findings)
     good("smb enum done")
+
+
+def _dn_to_domain(dn):
+    """'DC=checkpoint,DC=htb' -> 'checkpoint.htb'"""
+    parts = re.findall(r"DC=([^,]+)", dn or "", re.I)
+    return ".".join(parts) if parts else None
+
+
+def _impacket_bin(name):
+    """Kali packages these as impacket-<Name>; some installs keep the raw
+    <Name>.py script name instead - try both, skip gracefully if neither."""
+    for cand in (f"impacket-{name}", f"{name}.py"):
+        if TOOLS.get(cand):
+            return cand
+    return None
+
+
+_NXC_USER_ROW_RX = re.compile(r"^\S+\s+\S+\s+\d+\s+\S+\s+(\S+)\s+(?:\d{4}-\d{2}-\d{2}|<never>)", re.M)
+_KRB5TGS_RX = re.compile(r"\$krb5tgs\$\d+\$\*?([^\s*]+)")
+_KRB5ASREP_RX = re.compile(r"\$krb5asrep\$\d+\$([^\s:]+)")
+
+
+async def _impacket_roast_check(host, dom, runner, args, findings, tag, users_out):
+    """Cross-checks nxc's --kerberoasting/--asreproast with impacket's own
+    GetUserSPNs/GetNPUsers. Worth doing separately, not redundant: nxc
+    auto-derives the real LDAP search base from the DC's own rootDSE no
+    matter what --domain string it's given, while impacket's tools build the
+    search base directly from the domain string passed in - so a wrong or
+    mistyped --domain silently breaks impacket's tools with a confusing LDAP
+    referral error even when nxc's own check looked completely fine. That's
+    exactly the failure mode that prompted adding this cross-check, so `dom`
+    should be the domain derived from rootDSE (see _dn_to_domain), not raw
+    args.domain, whenever the former is available."""
+    if not dom:
+        return
+    loot_dir = os.path.join(runner.outdir, host, "ldap", "loot")
+    if not runner.dry_run:
+        os.makedirs(loot_dir, exist_ok=True)
+
+    spn_bin = _impacket_bin("GetUserSPNs")
+    np_bin = _impacket_bin("GetNPUsers")
+    if not spn_bin and not np_bin:
+        findings.append(Finding("INFO", "ldap", None,
+            "impacket's GetUserSPNs/GetNPUsers not found - Kerberoast/AS-REP cross-check skipped"))
+        return
+
+    if spn_bin:
+        user = f"{dom}/{args.user}"
+        if getattr(args, "hash", None):
+            target, hash_flag = _sh_quote(user), f"-hashes {_sh_quote(args.hash)}"
+        else:
+            target, hash_flag = _sh_quote(f"{user}:{args.password}"), ""
+        out_file = os.path.abspath(os.path.join(loot_dir, "kerb_impacket.txt"))
+        cmd = (f"{spn_bin} {target} {hash_flag} -dc-ip {host} -request "
+               f"-outputfile {_sh_quote(out_file)}").replace("  ", " ")
+        rc, out = await runner.run(cmd, f"{tag}/impacket_getuserspns.txt", "GetUserSPNs",
+                                   timeout=args.enum_timeout)
+        hits = sorted(set(_KRB5TGS_RX.findall(out or "")))
+        if hits:
+            findings.append(Finding("CRITICAL", "ldap", None,
+                f"Kerberoastable account(s) via GetUserSPNs: {', '.join(hits)} - "
+                f"hash(es) saved to {out_file}, crack with hashcat -m 13100"))
+
+    users = sorted(set(_NXC_USER_ROW_RX.findall(users_out or "")))
+    if np_bin and users:
+        users_file = os.path.join(loot_dir, "_candidate_users.txt")
+        if not runner.dry_run:
+            with open(users_file, "w") as f:
+                f.write("\n".join(users) + "\n")
+        out_file = os.path.abspath(os.path.join(loot_dir, "asrep_impacket.txt"))
+        cmd = (f"{np_bin} {_sh_quote(dom + '/')} -usersfile {_sh_quote(users_file)} -no-pass "
+               f"-dc-ip {host} -request -outputfile {_sh_quote(out_file)}")
+        rc, out = await runner.run(cmd, f"{tag}/impacket_getnpusers.txt", "GetNPUsers",
+                                   timeout=args.enum_timeout)
+        hits = sorted(set(_KRB5ASREP_RX.findall(out or "")))
+        if hits:
+            findings.append(Finding("CRITICAL", "ldap", None,
+                f"AS-REP roastable account(s) via GetNPUsers: {', '.join(hits)} - "
+                f"hash(es) saved to {out_file}, crack with hashcat -m 18200"))
+    good(f"{host}: impacket kerberoast/asreproast cross-check done")
 
 
 async def enum_ldap(host, port, runner, args, findings):
     tag = f"{host}/ldap"
+    real_domain = None
     if TOOLS.get("ldapsearch"):
         rc, out = await runner.run(
             f"ldapsearch -x -H ldap://{host}:{port} -s base -b '' namingContexts defaultNamingContext",
@@ -634,14 +982,21 @@ async def enum_ldap(host, port, runner, args, findings):
         m = re.search(r"(?:defaultNamingContext|namingContexts):\s*(DC=[^\n]+)", out or "", re.I)
         if m:
             base = m.group(1).strip()
+            real_domain = _dn_to_domain(base)
             findings.append(Finding("HIGH", "ldap", port, f"LDAP base found: {base}"))
             rc, out2 = await runner.run(
                 f"ldapsearch -x -H ldap://{host}:{port} -b '{base}'",
                 f"{tag}/anon_dump.txt", "ldap-dump", timeout=args.enum_timeout)
             scan_findings(out2, "ldap", port, findings)
-    # authenticated: netexec LDAP enum + BloodHound collection hint
+    # authenticated: netexec LDAP enum + kerberoast/asreproast cross-check + BloodHound hint
     if have_creds(args):
         nxc = nxc_bin()
+        dom = real_domain or args.domain or "<domain>"
+        if real_domain and args.domain and real_domain.lower() != args.domain.lower():
+            findings.append(Finding("INFO", "ldap", port,
+                f"--domain '{args.domain}' doesn't match the DC's real domain '{real_domain}' "
+                f"(from rootDSE) - using '{real_domain}' for the LDAP-derived checks below"))
+        users_out = ""
         if nxc:
             auth = nxc_auth(args)
             loot_dir = os.path.join(runner.outdir, host, "ldap", "loot")
@@ -655,7 +1010,10 @@ async def enum_ldap(host, port, runner, args, findings):
                                            f"{tag}/auth_ldap_{sub.split()[0].strip('-')}.txt",
                                            f"{nxc} ldap {sub.split()[0]}")
                 scan_findings(out, "ldap", port, findings)
-        dom = args.domain or "<domain>"
+                if sub == "--users":
+                    users_out = out or ""
+        await _impacket_roast_check(host, dom if dom != "<domain>" else None,
+                                    runner, args, findings, tag, users_out)
         findings.append(Finding("HIGH", "ad", port,
             f"Authenticated to LDAP - run BloodHound now: "
             f"bloodhound-python -u {args.user} -p <pass> -d {dom} -ns {host} -c all"))
@@ -909,56 +1267,83 @@ async def enum_rdp(host, port, runner, args, findings):
 
 
 # --------------------------------------------------------------------------- #
-#  Dispatcher: map services -> modules
+#  Dispatcher: map discovered services -> queued jobs
+#
+#  Pure and idempotent: called TWICE per host - once right after port
+#  discovery with port-guessed service names (so enum starts within
+#  seconds, not after the full nmap -sCV pass across every port), and again
+#  once service_scan() confirms real versions. Job ids are deterministic, so
+#  a job the guess pass already registered is a harmless dedup no-op on the
+#  confirm pass; a job the guess pass missed (nmap corrects a wrong guess)
+#  still fires from the confirm pass, just later, without blocking anything.
 # --------------------------------------------------------------------------- #
-async def dispatch(host, services, runner, args, findings, host_profile):
-    tasks = []
-    smb_seen = ldap_seen = False
+def register_service_jobs(queue, host, services, runner, args, findings, host_profile):
+    counted = host_profile.setdefault("_counted_ports", set())
     for port, meta in sorted(services.items()):
         name = meta.get("name", guess_service(port))
 
         if is_web(port, name):
-            tasks.append(enum_web(host, port, name, runner, args, findings))
+            queue.add_job(Job(f"{host}:web:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_web, host, port, name, runner, args, findings)))
+            if args.nikto:
+                queue.add_job(Job(f"{host}:nikto:{port}", PRIO_BACKGROUND, background=True,
+                    coro_factory=functools.partial(enum_nikto, host, port, name, runner, args, findings)))
+            if args.nuclei:
+                queue.add_job(Job(f"{host}:nuclei:{port}", PRIO_BACKGROUND, background=True,
+                    coro_factory=functools.partial(enum_nuclei, host, port, name, runner, args, findings)))
         elif port in (139, 445) or "microsoft-ds" in name or "netbios" in name:
-            if not smb_seen:
-                tasks.append(enum_smb(host, runner, args, findings)); smb_seen = True
+            queue.add_job(Job(f"{host}:smb", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_smb, host, runner, args, findings)))
         elif port in (389, 636, 3268, 3269) or "ldap" in name:
-            if not ldap_seen:
-                tasks.append(enum_ldap(host, port, runner, args, findings)); ldap_seen = True
+            queue.add_job(Job(f"{host}:ldap", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_ldap, host, port, runner, args, findings)))
         elif port == 21 or "ftp" in name:
-            tasks.append(enum_ftp(host, port, runner, args, findings))
+            queue.add_job(Job(f"{host}:ftp:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_ftp, host, port, runner, args, findings)))
         elif port == 22 or "ssh" in name:
-            tasks.append(enum_ssh(host, port, runner, args, findings))
+            queue.add_job(Job(f"{host}:ssh:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_ssh, host, port, runner, args, findings)))
         elif port == 25 or port in (465, 587) or "smtp" in name:
-            tasks.append(enum_smtp(host, port, runner, args, findings))
+            queue.add_job(Job(f"{host}:smtp:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_smtp, host, port, runner, args, findings)))
         elif port == 53 or "domain" in name or "dns" in name:
-            tasks.append(enum_dns(host, port, runner, args, findings))
+            queue.add_job(Job(f"{host}:dns:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_dns, host, port, runner, args, findings)))
         elif port == 2049 or "nfs" in name:
-            tasks.append(enum_nfs(host, runner, args, findings))
+            queue.add_job(Job(f"{host}:nfs", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_nfs, host, runner, args, findings)))
         elif port == 1433 or "ms-sql" in name or "mssql" in name:
-            tasks.append(enum_mssql(host, port, runner, args, findings))
+            queue.add_job(Job(f"{host}:mssql:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_mssql, host, port, runner, args, findings)))
         elif port in (6379,) or "redis" in name:
-            tasks.append(enum_redis(host, port, runner, args, findings))
+            queue.add_job(Job(f"{host}:redis:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_redis, host, port, runner, args, findings)))
         elif port == 5432 or "postgres" in name:
-            tasks.append(enum_postgres(host, port, runner, args, findings))
+            queue.add_job(Job(f"{host}:postgres:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_postgres, host, port, runner, args, findings)))
         elif port in (110, 995) or "pop3" in name:
-            tasks.append(enum_pop3(host, port, runner, args, findings))
+            queue.add_job(Job(f"{host}:pop3:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_pop3, host, port, runner, args, findings)))
         elif port in (143, 993) or "imap" in name:
-            tasks.append(enum_imap(host, port, runner, args, findings))
+            queue.add_job(Job(f"{host}:imap:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_imap, host, port, runner, args, findings)))
         elif port in (5985, 5986) or "winrm" in name:
-            tasks.append(enum_winrm(host, port, runner, args, findings))
+            queue.add_job(Job(f"{host}:winrm:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_winrm, host, port, runner, args, findings)))
         elif port == 3389 or "ms-wbt" in name or "rdp" in name:
-            tasks.append(enum_rdp(host, port, runner, args, findings))
+            queue.add_job(Job(f"{host}:rdp:{port}", PRIO_ENUM, background=False,
+                coro_factory=functools.partial(enum_rdp, host, port, runner, args, findings)))
 
-        # profile hints
-        if port == 88 or "kerberos" in name:
-            host_profile["dc_signals"] += 1
-            findings.append(Finding("HIGH", "ad", 88, "Kerberos (88) open - strong Domain Controller signal"))
-        if port in (389, 636) and (445 in services or 88 in services):
-            host_profile["dc_signals"] += 1
-
-    if tasks:
-        await asyncio.gather(*tasks)
+        # profile hints - guarded per-port so the guess pass + confirm pass
+        # (both of which see this same port) never double-count.
+        if port not in counted:
+            if port == 88 or "kerberos" in name:
+                host_profile["dc_signals"] += 1
+                findings.append(Finding("HIGH", "ad", 88, "Kerberos (88) open - strong Domain Controller signal"))
+                counted.add(port)
+            elif port in (389, 636) and (445 in services or 88 in services):
+                host_profile["dc_signals"] += 1
+                counted.add(port)
 
 
 # --------------------------------------------------------------------------- #
@@ -1072,40 +1457,149 @@ def write_markdown(host, services, udp, findings, outdir, host_profile):
 
 # --------------------------------------------------------------------------- #
 #  Host orchestration
+#
+#  Each job_* wrapper owns "register whatever comes next" as a side effect of
+#  finishing its own await - that's the whole dependency mechanism: a job is
+#  only ever added by code that runs after its prerequisite already
+#  completed, so every job in the queue is runnable the instant it's added.
+#  discover_ports()/service_scan()/udp_scan()/enum_*() themselves are
+#  untouched pure workers.
 # --------------------------------------------------------------------------- #
-async def scan_host(host, runner, args):
-    t0 = time.time()
-    findings = []
-    host_profile = {"dc_signals": 0}
-    os.makedirs(os.path.join(runner.outdir, host, "scans"), exist_ok=True)
-
-    good(f"=== target: {host} ===")
-    ports = await discover_ports(host, runner, args)
-    if runner.dry_run:
-        ports = ports or [21, 22, 80, 445]  # sample so the plan shows modules
+async def job_discover(host, runner, args, queue, findings, host_profile, host_state, state_store):
+    if (args.resume and state_store
+            and state_store.job_status(f"{host}:discover") == "done"
+            and state_store.data.get("ports")):
+        ports = state_store.data["ports"]
+        info(f"resume: using {len(ports)} cached port(s) for {host}")
+    else:
+        ports = await discover_ports(host, runner, args)
+        if runner.dry_run:
+            ports = ports or [21, 22, 80, 445]  # sample so the plan shows modules
+        if state_store:
+            await state_store.save_ports_services(ports=ports)
+    host_state["ports"] = ports
 
     if not ports:
         warn(f"{host}: no open TCP ports found (host down / filtered / try --no-rustscan)")
-        return
+        return ports
     good(f"{host}: {len(ports)} open port(s): {', '.join(map(str, ports))}")
 
-    # accuracy pass + udp in parallel
-    services, udp = await asyncio.gather(
-        service_scan(host, ports, runner, args),
-        udp_scan(host, runner, args),
-    )
+    # guess pass: fast opportunistic modules start now, without waiting on nmap
+    guessed = {p: {"name": guess_service(p), "version": ""} for p in ports}
+    register_service_jobs(queue, host, guessed, runner, args, findings, host_profile)
 
-    # enumerate services concurrently, alongside exploit-db correlation
-    await asyncio.gather(
-        dispatch(host, services, runner, args, findings, host_profile),
-        searchsploit_lookup(host, services, runner, args, findings),
-    )
+    queue.add_job(Job(f"{host}:service_scan", PRIO_SCAN, background=False, always_reenter=True,
+        coro_factory=functools.partial(job_service_scan, host, ports, runner, args,
+                                        queue, findings, host_profile, host_state, state_store)))
+    queue.add_job(Job(f"{host}:udp_scan", PRIO_SCAN, background=True,
+        coro_factory=functools.partial(job_udp_scan, host, runner, args, host_state, state_store)))
+    if args.mode == "deep" and TOOLS.get("nmap"):
+        queue.add_job(Job(f"{host}:vuln_scan", PRIO_BACKGROUND, background=True,
+            coro_factory=functools.partial(job_vuln_scan, host, ports, runner, args, findings)))
+    return ports
 
-    elapsed = time.time() - t0
-    if not runner.dry_run:
-        print_summary(host, services, udp, findings, host_profile, elapsed, args)
-        md = write_markdown(host, services, udp, findings, runner.outdir, host_profile)
-        good(f"notes written: {md}")
+
+async def job_service_scan(host, ports, runner, args, queue, findings, host_profile, host_state, state_store):
+    if (args.resume and state_store
+            and state_store.job_status(f"{host}:service_scan") == "done"
+            and state_store.data.get("services")):
+        services = state_store.data["services"]
+        info(f"resume: using cached service scan for {host}")
+    else:
+        services = await service_scan(host, ports, runner, args)
+        if state_store:
+            await state_store.save_ports_services(services=services)
+    host_state["services"] = services
+
+    # confirm pass: corrects anything the port-guess pass got wrong or missed
+    register_service_jobs(queue, host, services, runner, args, findings, host_profile)
+
+    if not args.no_exploit_search:
+        queue.add_job(Job(f"{host}:searchsploit", PRIO_EXPLOIT, background=False,
+            coro_factory=functools.partial(searchsploit_lookup, host, services, runner, args, findings)))
+    return services
+
+
+async def job_udp_scan(host, runner, args, host_state, state_store):
+    udp = await udp_scan(host, runner, args)
+    host_state["udp"] = udp
+    if state_store:
+        await state_store.save_ports_services(udp=udp)
+    return udp
+
+
+_NMAP_PORT_BLOCK_RX = re.compile(r"^(\d+)/tcp\s+open\b", re.M)
+
+
+async def job_vuln_scan(host, ports, runner, args, findings):
+    """--mode deep only: an extra nmap NSE vuln-category sweep, backgrounded
+    since it's slow and purely opportunistic."""
+    plist = ",".join(str(p) for p in ports)
+    cmd = f"nmap -Pn -sV --script vuln -p {plist} -oN /dev/stdout {host}"
+    rc, out = await runner.run(cmd, outfile=f"{host}/scans/nmap_vuln.txt",
+                               label="nmap-vuln", timeout=args.scan_timeout)
+    # Split into per-port blocks so findings get attributed to their real
+    # port instead of a bare port=None duplicate of what service_scan/enum_*
+    # already found (the -sV banner text that reappears in this output would
+    # otherwise re-trigger the same FINDING_RULES with a different dedup key).
+    blocks = list(_NMAP_PORT_BLOCK_RX.finditer(out or ""))
+    if not blocks:
+        scan_findings(out, "vuln", None, findings)
+    else:
+        for i, m in enumerate(blocks):
+            end = blocks[i + 1].start() if i + 1 < len(blocks) else len(out)
+            scan_findings(out[m.start():end], "vuln", int(m.group(1)), findings)
+    good(f"{host}: vuln-script scan done")
+
+
+async def scan_host(host, runner, args):
+    t0 = time.time()
+    host_profile = {"dc_signals": 0}
+    host_state = {"ports": [], "services": {}, "udp": {}}
+    os.makedirs(os.path.join(runner.outdir, host, "scans"), exist_ok=True)
+
+    good(f"=== target: {host} ===")
+
+    state_store = None if runner.dry_run else StateStore(runner.outdir, host)
+    if args.resume and state_store:
+        state_store.load()
+    if state_store:
+        state_store.data["mode"] = args.mode
+        state_store.data["started_at"] = state_store.data.get("started_at") or \
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    findings = FindingsList(state_store=state_store)
+    if args.resume and state_store and state_store.data.get("findings"):
+        for sev, svc, port, text in state_store.data["findings"]:
+            findings.seed(Finding(sev, svc, port, text))
+        if findings:
+            info(f"resume: restored {len(findings)} cached finding(s) for {host}")
+
+    async with JobQueue(workers=args.workers, state_store=state_store) as queue:
+        queue.add_job(Job(f"{host}:discover", PRIO_DISCOVER, background=False, always_reenter=True,
+            coro_factory=functools.partial(job_discover, host, runner, args, queue,
+                                            findings, host_profile, host_state, state_store)))
+        await queue.wait_core_done()
+
+        if not host_state["ports"]:
+            return
+
+        elapsed = time.time() - t0
+        if not runner.dry_run:
+            print_summary(host, host_state["services"], host_state["udp"], findings,
+                          host_profile, elapsed, args)
+            md = write_markdown(host, host_state["services"], host_state["udp"], findings,
+                                runner.outdir, host_profile)
+            good(f"notes written: {md}")
+
+        if queue.had_background_jobs:
+            info("background modules (udp/nikto/nuclei/vuln-scan) still running - "
+                 "NOTES.md will be refreshed when they finish")
+        await queue.wait_all_done()
+        if not runner.dry_run and queue.had_background_jobs:
+            write_markdown(host, host_state["services"], host_state["udp"], findings,
+                           runner.outdir, host_profile)
+            good(f"{host}: background modules finished - notes updated")
 
 
 # --------------------------------------------------------------------------- #
@@ -1132,7 +1626,7 @@ async def spray_credential(hosts, runner, args):
     auth = nxc_auth(args)
     targets = " ".join(hosts)
     good(f"spraying {C.M}{cred_label(args)}{C.END} across {len(hosts)} host(s) via SMB/WinRM")
-    findings = []
+    findings = FindingsList()
     os.makedirs(os.path.join(runner.outdir, "_spray"), exist_ok=True)
     locked_out = False
     for proto in ("smb", "winrm"):
@@ -1211,17 +1705,25 @@ def build_argparser():
     cg.add_argument("--local-auth", action="store_true", help="treat creds as LOCAL account, not domain")
     cg.add_argument("--spray", action="store_true",
                     help="spray the ONE credential across all hosts (CIDR) via SMB/WinRM")
-    p.add_argument("--quick", action="store_true", help="top-1000 ports only (fast)")
+    p.add_argument("--mode", choices=("quick", "full", "deep"), default=None,
+                   help="scan profile: quick (fast, no UDP/scripts), full (default), "
+                        "deep (bigger wordlist, nikto+nuclei+vuln-scripts auto-on)")
+    p.add_argument("--quick", action="store_true", help="top-1000 ports only (fast); shorthand for --mode quick")
     p.add_argument("--top-ports", type=int, help="scan only the top N common ports")
     p.add_argument("--no-udp", action="store_true", help="skip UDP scan")
     p.add_argument("--no-scripts", action="store_true", help="nmap -sV only, no -sC")
     p.add_argument("--no-rustscan", action="store_true", help="force built-in async scanner")
-    p.add_argument("--nikto", action="store_true", help="run nikto on web ports (noisy)")
+    p.add_argument("--nikto", action="store_true", help="run nikto on web ports (noisy, backgrounded)")
+    p.add_argument("--nuclei", action="store_true", help="run nuclei on web ports (backgrounded)")
     p.add_argument("--ping-sweep", action="store_true", help="liveness-check a CIDR first")
     p.add_argument("--wordlist", default=None,
-                   help="dirbrute wordlist (default: auto-detect a seclists/dirbuster medium list)")
+                   help="dirbrute wordlist (default: auto-detect, mode-aware)")
     p.add_argument("--concurrency", type=int, default=800, help="async scan concurrency")
     p.add_argument("--parallel", type=int, default=6, help="max concurrent external commands")
+    p.add_argument("--workers", type=int, default=8,
+                   help="job-queue worker pool size (how many modules run at once)")
+    p.add_argument("--version-intensity", type=int, default=None,
+                   help="nmap --version-intensity for -sCV (default 6, 9 in --mode deep)")
     p.add_argument("--host-timeout", type=float, default=1.5, help="per-port connect timeout (s)")
     p.add_argument("--scan-timeout", type=int, default=1800, help="port/service scan timeout (s)")
     p.add_argument("--enum-timeout", type=int, default=600, help="per-enum-module timeout (s)")
@@ -1246,13 +1748,22 @@ BANNER = r"""
 
 # candidate dirbrute wordlists, checked in order - seclists has renamed this
 # file across releases (DirBuster-2007_ prefix added, then dropped again), so
-# don't trust one hardcoded path.
+# don't trust one hardcoded path. Mode-aware: quick wants something small and
+# fast, deep wants the biggest list actually installed.
+QUICK_WORDLISTS = [
+    "/usr/share/wordlists/dirb/common.txt",
+    "/usr/share/seclists/Discovery/Web-Content/common.txt",
+]
 DEFAULT_WORDLISTS = [
     "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt",
     "/usr/share/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt",
     "/usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt",
     "/usr/share/wordlists/dirb/common.txt",
 ]
+DEEP_WORDLISTS = [
+    "/usr/share/seclists/Discovery/Web-Content/raft-large-directories.txt",
+    "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt",
+] + DEFAULT_WORDLISTS
 
 
 def resolve_wordlist(args):
@@ -1266,7 +1777,9 @@ def resolve_wordlist(args):
             warn(f"wordlist not found: {args.wordlist} - dirbrute will be skipped")
             args.wordlist = None
         return
-    for cand in DEFAULT_WORDLISTS:
+    candidates = {"quick": QUICK_WORDLISTS, "deep": DEEP_WORDLISTS}.get(
+        getattr(args, "mode", None), DEFAULT_WORDLISTS)
+    for cand in candidates:
         if os.path.isfile(cand):
             args.wordlist = cand
             return
@@ -1277,7 +1790,33 @@ def resolve_wordlist(args):
 TOP_1000 = [1,3,7,9,13,17,19,21,22,23,25,26,37,53,79,80,81,88,106,110,111,113,119,135,139,143,144,179,199,389,427,443,444,445,465,513,514,515,543,544,548,554,587,631,646,873,990,993,995,1025,1026,1027,1028,1029,1110,1433,1434,1521,1720,1723,1755,1900,2000,2001,2049,2121,2717,3000,3128,3268,3269,3306,3389,3986,4899,5000,5009,5051,5060,5101,5190,5357,5432,5631,5666,5800,5900,5985,5986,6000,6001,6379,6646,7070,8000,8008,8009,8080,8081,8443,8888,9100,9200,9999,10000,27017,32768,49152,49153,49154,49155,49156,49157]
 
 
+def apply_mode_defaults(args):
+    """Resolve --mode into the underlying flags. Mode defaults only ever
+    strengthen a store_true flag from False->True, never the reverse -
+    Python 3.8 (this tool's floor) has no reliable way to detect "the user
+    explicitly passed --no-X" for a plain store_true flag, so an explicit
+    flag can only ever be left alone or turned on by mode, never overridden
+    off. --mode quick forcing no_udp/no_scripts True is a known, accepted
+    limitation: there's no way to un-force that short of not using that mode.
+    """
+    if args.mode is None:
+        args.mode = "quick" if args.quick else "full"
+    elif args.mode == "quick":
+        args.quick = True
+
+    if args.mode == "quick":
+        args.no_udp = True
+        args.no_scripts = True
+    elif args.mode == "deep":
+        args.nikto = True
+        args.nuclei = True
+        if args.version_intensity is None:
+            args.version_intensity = 9
+    return args.mode
+
+
 async def amain(args):
+    apply_mode_defaults(args)
     refresh_tools()
     resolve_wordlist(args)
     runner = Runner(args.outdir, dry_run=args.dry_run,
@@ -1285,11 +1824,12 @@ async def amain(args):
     runner.sem = asyncio.Semaphore(args.parallel)
 
     print(C.CY + BANNER + C.END)
+    info(f"mode: {C.M}{args.mode}{C.END}  workers: {args.workers}  parallel: {args.parallel}")
     missing = [t for t in ("rustscan", "nmap", "feroxbuster", "gobuster", "whatweb",
-                           "enum4linux-ng", "nxc", "netexec") if not TOOLS.get(t)]
+                           "enum4linux-ng", "nxc", "netexec", "nuclei") if not TOOLS.get(t)]
     have = [t for t in ("rustscan", "nmap", "feroxbuster", "gobuster", "whatweb",
                         "enum4linux-ng", "nxc", "netexec", "smbclient", "ldapsearch",
-                        "snmpwalk", "curl") if TOOLS.get(t)]
+                        "snmpwalk", "curl", "nuclei") if TOOLS.get(t)]
     info(f"tools available: {C.G}{', '.join(have) or 'none'}{C.END}")
     if missing:
         warn(f"missing (modules will degrade/skip): {C.DIM}{', '.join(missing)}{C.END}")
