@@ -1361,15 +1361,18 @@ async def enum_postgres(host, port, runner, args, findings):
     good("postgres enum done")
 
 
-async def _mail_probe(host, port, tls, runner, tag, label):
-    """Grab a mail banner + CAPABILITY. Uses openssl for TLS ports, ncat/nc otherwise."""
+async def _mail_probe(host, port, tls, runner, tag, label, payload="CAPA\\r\\nQUIT\\r\\n"):
+    """Send a raw payload and grab the response. Uses openssl for TLS ports,
+    ncat/nc otherwise. Default payload is POP3/generic CAPA+QUIT; callers on
+    a protocol that needs tagged commands (e.g. IMAP's 'a1 CAPABILITY') pass
+    their own."""
     if tls and TOOLS.get("openssl"):
-        cmd = (f"printf 'CAPA\\r\\nQUIT\\r\\n' | timeout 15 "
+        cmd = (f"printf '{payload}' | timeout 15 "
                f"openssl s_client -quiet -connect {host}:{port} 2>/dev/null")
     elif TOOLS.get("ncat"):
-        cmd = f"printf 'CAPA\\r\\nQUIT\\r\\n' | ncat --recv-only -w 10 {host} {port}"
+        cmd = f"printf '{payload}' | ncat --recv-only -w 10 {host} {port}"
     elif TOOLS.get("nc"):
-        cmd = f"printf 'CAPA\\r\\nQUIT\\r\\n' | nc -w 10 {host} {port}"
+        cmd = f"printf '{payload}' | nc -w 10 {host} {port}"
     else:
         cmd = None
     if cmd:
@@ -1403,22 +1406,13 @@ async def enum_imap(host, port, runner, args, findings):
             f"nmap -Pn -p {port} --script imap-capabilities,imap-ntlm-info -oN /dev/stdout {host}",
             f"{tag}/imap_nse.txt", "nmap-imap")
         scan_findings(out, "imap", port, findings)
-    # IMAP CAPABILITY needs a tagged command
-    if tls and TOOLS.get("openssl"):
-        cmd = (f"printf 'a1 CAPABILITY\\r\\na2 LOGOUT\\r\\n' | timeout 15 "
-               f"openssl s_client -quiet -connect {host}:{port} 2>/dev/null")
-    elif TOOLS.get("ncat"):
-        cmd = f"printf 'a1 CAPABILITY\\r\\na2 LOGOUT\\r\\n' | ncat --recv-only -w 10 {host} {port}"
-    elif TOOLS.get("nc"):
-        cmd = f"printf 'a1 CAPABILITY\\r\\na2 LOGOUT\\r\\n' | nc -w 10 {host} {port}"
-    else:
-        cmd = None
-    if cmd:
-        rc, out = await runner.run(cmd, f"{tag}/imap_banner.txt", "imap-capa", timeout=30)
-        scan_findings(out, "imap", port, findings)
-        if out and ("CAPABILITY" in out.upper() or "* OK" in out):
-            findings.append(Finding("HIGH", "imap", port,
-                                    "IMAP LOGIN available - reuse creds harvested elsewhere"))
+    # IMAP CAPABILITY needs a tagged command, unlike POP3's plain CAPA
+    banner = await _mail_probe(host, port, tls, runner, tag, "imap",
+                               payload="a1 CAPABILITY\\r\\na2 LOGOUT\\r\\n")
+    scan_findings(banner, "imap", port, findings)
+    if banner and ("CAPABILITY" in banner.upper() or "* OK" in banner):
+        findings.append(Finding("HIGH", "imap", port,
+                                "IMAP LOGIN available - reuse creds harvested elsewhere"))
     good("imap enum done")
 
 
