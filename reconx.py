@@ -153,7 +153,8 @@ def refresh_tools():
               "hydra", "ssh", "redis-cli", "psql", "openssl", "ncat", "nc",
               "searchsploit",
               "impacket-GetUserSPNs", "GetUserSPNs.py",
-              "impacket-GetNPUsers", "GetNPUsers.py"):
+              "impacket-GetNPUsers", "GetNPUsers.py",
+              "bloodhound-python", "bloodhound-ce-python"):
         TOOLS[t] = which(t)
 
 
@@ -1031,7 +1032,52 @@ async def _impacket_roast_check(host, dom, runner, args, findings, tag, users_ou
     good(f"{host}: impacket kerberoast/asreproast cross-check done")
 
 
-async def enum_ldap(host, port, runner, args, findings):
+def _bloodhound_bin():
+    for cand in ("bloodhound-python", "bloodhound-ce-python"):
+        if TOOLS.get(cand):
+            return cand
+    return None
+
+
+async def enum_bloodhound(host, dom, runner, args, findings):
+    """Background job (--bloodhound): full BloodHound collection (-c All).
+    Registered from enum_ldap() once it knows the DC's real domain (see
+    _dn_to_domain), not from register_service_jobs() - the domain isn't
+    known until the rootDSE lookup inside enum_ldap() runs.
+
+    Explicitly points -ns (nameserver) at the DC itself rather than relying
+    on this machine's default DNS: bloodhound-python resolves every
+    computer object it finds, so a wrong/absent DNS server breaks that
+    silently across the whole collection - the same class of failure the
+    domain-typo cross-check above exists to catch for impacket's tools."""
+    bin_name = _bloodhound_bin()
+    if not bin_name or not dom:
+        return
+    bh_dir = os.path.join(runner.outdir, host, "ldap", "bloodhound")
+    if not runner.dry_run:
+        os.makedirs(bh_dir, exist_ok=True)
+    if getattr(args, "hash", None):
+        auth = f"--hashes {_sh_quote(args.hash)}"
+    else:
+        auth = f"-p {_sh_quote(args.password)}"
+    cmd = (f"cd {_sh_quote(bh_dir)} && {bin_name} -u {_sh_quote(args.user + '@' + dom)} {auth} "
+           f"-d {_sh_quote(dom)} -ns {host} -c All --zip")
+    outfile = f"{host}/ldap/bloodhound_collect.txt"
+    rc, out = await runner.run(cmd, outfile, "bloodhound", timeout=args.scan_timeout)
+    if rc == 0:
+        findings.append(Finding("HIGH", "ad", None,
+            f"BloodHound collection complete - load the .zip from {bh_dir} into BloodHound and hunt for attack paths"))
+    elif not runner.dry_run:
+        # surface failure as a finding too, not just a log line buried in
+        # outfile - e.g. LDAP signing enforced + LDAPS unreachable/reset is
+        # a real failure mode seen in testing, distinct from "just missing
+        # a tool" and easy to miss if only the raw output file has it
+        findings.append(Finding("MEDIUM", "ad", None,
+            f"BloodHound collection failed (exit {rc}) - see {outfile} for details"))
+    good(f"{host}: BloodHound collection done")
+
+
+async def enum_ldap(host, port, runner, args, findings, queue):
     tag = f"{host}/ldap"
     real_domain = None
     if TOOLS.get("ldapsearch"):
@@ -1073,11 +1119,15 @@ async def enum_ldap(host, port, runner, args, findings):
                 scan_findings(out, "ldap", port, findings)
                 if sub == "--users":
                     users_out = out or ""
-        await _impacket_roast_check(host, dom if dom != "<domain>" else None,
-                                    runner, args, findings, tag, users_out)
-        findings.append(Finding("HIGH", "ad", port,
-            f"Authenticated to LDAP - run BloodHound now: "
-            f"bloodhound-python -u {args.user} -p <pass> -d {dom} -ns {host} -c all"))
+        real_dom = dom if dom != "<domain>" else None
+        await _impacket_roast_check(host, real_dom, runner, args, findings, tag, users_out)
+        if args.bloodhound and real_dom:
+            queue.add_job(Job(f"{host}:bloodhound", PRIO_BACKGROUND, background=True,
+                coro_factory=functools.partial(enum_bloodhound, host, real_dom, runner, args, findings)))
+        else:
+            findings.append(Finding("HIGH", "ad", port,
+                f"Authenticated to LDAP - run BloodHound now: "
+                f"bloodhound-python -u {args.user}@{dom} -p <pass> -d {dom} -ns {host} -c All"))
     good("ldap enum done")
 
 
@@ -1388,7 +1438,7 @@ def register_service_jobs(queue, host, services, runner, args, findings, host_pr
                 coro_factory=functools.partial(enum_smb, host, runner, args, findings)))
         elif port in (389, 636, 3268, 3269) or "ldap" in name:
             queue.add_job(Job(f"{host}:ldap", prio("ldap"), background=False,
-                coro_factory=functools.partial(enum_ldap, host, port, runner, args, findings)))
+                coro_factory=functools.partial(enum_ldap, host, port, runner, args, findings, queue)))
         elif port == 21 or "ftp" in name:
             queue.add_job(Job(f"{host}:ftp:{port}", prio("ftp"), background=False,
                 coro_factory=functools.partial(enum_ftp, host, port, runner, args, findings)))
@@ -1814,6 +1864,8 @@ def build_argparser():
     p.add_argument("--no-scripts", action="store_true", help="nmap -sV only, no -sC")
     p.add_argument("--no-rustscan", action="store_true", help="force built-in async scanner")
     p.add_argument("--nikto", action="store_true", help="run nikto on web ports (noisy, backgrounded)")
+    p.add_argument("--bloodhound", action="store_true",
+                   help="run a full BloodHound collection (-c All) against an authenticated LDAP target (backgrounded)")
     p.add_argument("--ping-sweep", action="store_true", help="liveness-check a CIDR first")
     p.add_argument("--wordlist", default=None,
                    help="dirbrute wordlist (default: auto-detect, mode-aware)")
