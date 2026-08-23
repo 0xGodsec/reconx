@@ -154,7 +154,8 @@ def refresh_tools():
               "searchsploit",
               "impacket-GetUserSPNs", "GetUserSPNs.py",
               "impacket-GetNPUsers", "GetNPUsers.py",
-              "bloodhound-python", "bloodhound-ce-python"):
+              "bloodhound-python", "bloodhound-ce-python",
+              "smtp-user-enum"):
         TOOLS[t] = which(t)
 
 
@@ -1181,6 +1182,27 @@ async def enum_snmp(host, runner, args, findings):
     good("snmp enum done")
 
 
+# candidate username wordlists for smtp-user-enum, checked in order - nmap's
+# own smtp-enum-users NSE script (run unconditionally below) only tries a
+# tiny built-in list, so this dedicated pass with a real wordlist is what
+# actually finds accounts on a server that supports VRFY/EXPN/RCPT TO.
+_SMTP_USER_WORDLISTS = [
+    "/usr/share/seclists/Usernames/top-usernames-shortlist.txt",
+    "/usr/share/metasploit-framework/data/wordlists/unix_users.txt",
+    "/usr/share/wordlists/metasploit/unix_users.txt",
+]
+
+
+def _smtp_userlist():
+    for cand in _SMTP_USER_WORDLISTS:
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+_SMTP_ENUM_USER_RX = re.compile(r":\s*(\S+)\s+exists\b", re.I)
+
+
 async def enum_smtp(host, port, runner, args, findings):
     tag = f"{host}/smtp"
     if TOOLS.get("nmap"):
@@ -1188,6 +1210,22 @@ async def enum_smtp(host, port, runner, args, findings):
             f"nmap -Pn -p {port} --script smtp-commands,smtp-enum-users,smtp-open-relay -oN /dev/stdout {host}",
             f"{tag}/smtp_nse.txt", "nmap-smtp")
         scan_findings(out, "smtp", port, findings)
+    if TOOLS.get("smtp-user-enum"):
+        userlist = _smtp_userlist()
+        if userlist:
+            cmd = f"smtp-user-enum -m VRFY -U {shlex.quote(userlist)} -h {host} -p {port}"
+            rc2, out2 = await runner.run(cmd, f"{tag}/smtp-user-enum_vrfy.txt",
+                                         "smtp-user-enum", timeout=args.enum_timeout)
+            users = sorted(set(_SMTP_ENUM_USER_RX.findall(out2 or "")))
+            if users:
+                shown = ", ".join(users[:10])
+                more = f" (+{len(users) - 10} more)" if len(users) > 10 else ""
+                findings.append(Finding("HIGH", "smtp", port,
+                    f"SMTP user enumeration (VRFY) confirmed account(s): {shown}{more} - "
+                    f"reuse as usernames against SSH/web/mail login"))
+        else:
+            findings.append(Finding("INFO", "smtp", port,
+                "smtp-user-enum installed but no username wordlist found - user enum skipped"))
     good("smtp enum done")
 
 
