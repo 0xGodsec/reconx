@@ -861,6 +861,17 @@ def _web_target(host, port, name):
     return scheme, base, tag
 
 
+async def _nmap_nse(host, port, scripts, proto, runner, tag, findings, timeout=None):
+    """Run an nmap NSE script set against one port, save output to
+    <tag>/<proto>_nse.txt, and scan it into findings. Returns the raw output
+    text for callers that need to inspect it further (e.g. RDP NTLM info)."""
+    rc, out = await runner.run(
+        f"nmap -Pn -p {port} --script {scripts} -oN /dev/stdout {host}",
+        f"{tag}/{proto}_nse.txt", f"nmap-{proto}", timeout=timeout)
+    scan_findings(out, proto, port, findings)
+    return out
+
+
 async def enum_web(host, port, name, runner, args, findings):
     scheme, base, tag = _web_target(host, port, name)
 
@@ -1126,10 +1137,7 @@ async def enum_ldap(host, port, runner, args, findings, queue):
 async def enum_ftp(host, port, runner, args, findings):
     tag = f"{host}/ftp"
     if TOOLS.get("nmap"):
-        rc, out = await runner.run(
-            f"nmap -Pn -p {port} --script ftp-anon,ftp-syst -oN /dev/stdout {host}",
-            f"{tag}/ftp_nse.txt", "nmap-ftp")
-        scan_findings(out, "ftp", port, findings)
+        await _nmap_nse(host, port, "ftp-anon,ftp-syst", "ftp", runner, tag, findings)
     if TOOLS.get("curl"):
         rc, out = await runner.run(f"curl -s --max-time 15 ftp://anonymous:anonymous@{host}:{port}/",
                                    f"{tag}/anon_list.txt", "ftp-anon-curl")
@@ -1141,10 +1149,7 @@ async def enum_ftp(host, port, runner, args, findings):
 async def enum_ssh(host, port, runner, args, findings):
     tag = f"{host}/ssh"
     if TOOLS.get("nmap"):
-        rc, out = await runner.run(
-            f"nmap -Pn -p {port} --script ssh2-enum-algos,ssh-auth-methods,ssh-hostkey -oN /dev/stdout {host}",
-            f"{tag}/ssh_nse.txt", "nmap-ssh")
-        scan_findings(out, "ssh", port, findings)
+        await _nmap_nse(host, port, "ssh2-enum-algos,ssh-auth-methods,ssh-hostkey", "ssh", runner, tag, findings)
     # authenticated: validate the credential over SSH via netexec (no brute; single try)
     if have_creds(args) and not getattr(args, "hash", None):
         nxc = nxc_bin()
@@ -1204,10 +1209,7 @@ _SMTP_ENUM_MODES = ("VRFY", "EXPN", "RCPT")
 async def enum_smtp(host, port, runner, args, findings):
     tag = f"{host}/smtp"
     if TOOLS.get("nmap"):
-        rc, out = await runner.run(
-            f"nmap -Pn -p {port} --script smtp-commands,smtp-enum-users,smtp-open-relay -oN /dev/stdout {host}",
-            f"{tag}/smtp_nse.txt", "nmap-smtp")
-        scan_findings(out, "smtp", port, findings)
+        await _nmap_nse(host, port, "smtp-commands,smtp-enum-users,smtp-open-relay", "smtp", runner, tag, findings)
     if TOOLS.get("smtp-user-enum"):
         userlist = _smtp_userlist()
         if userlist:
@@ -1380,10 +1382,7 @@ async def enum_pop3(host, port, runner, args, findings):
     tag = f"{host}/pop3"
     tls = port in (995,)
     if TOOLS.get("nmap"):
-        rc, out = await runner.run(
-            f"nmap -Pn -p {port} --script pop3-capabilities,pop3-ntlm-info -oN /dev/stdout {host}",
-            f"{tag}/pop3_nse.txt", "nmap-pop3")
-        scan_findings(out, "pop3", port, findings)
+        await _nmap_nse(host, port, "pop3-capabilities,pop3-ntlm-info", "pop3", runner, tag, findings)
     banner = await _mail_probe(host, port, tls, runner, tag, "pop3")
     # POP3 CAPA speaks USER/SASL; craft the finding from what we saw
     scan_findings(banner, "pop3", port, findings)
@@ -1397,10 +1396,7 @@ async def enum_imap(host, port, runner, args, findings):
     tag = f"{host}/imap"
     tls = port in (993,)
     if TOOLS.get("nmap"):
-        rc, out = await runner.run(
-            f"nmap -Pn -p {port} --script imap-capabilities,imap-ntlm-info -oN /dev/stdout {host}",
-            f"{tag}/imap_nse.txt", "nmap-imap")
-        scan_findings(out, "imap", port, findings)
+        await _nmap_nse(host, port, "imap-capabilities,imap-ntlm-info", "imap", runner, tag, findings)
     # IMAP CAPABILITY needs a tagged command, unlike POP3's plain CAPA
     banner = await _mail_probe(host, port, tls, runner, tag, "imap",
                                payload="a1 CAPABILITY\\r\\na2 LOGOUT\\r\\n")
@@ -1435,10 +1431,8 @@ async def enum_winrm(host, port, runner, args, findings):
 
 async def enum_rdp(host, port, runner, args, findings):
     if TOOLS.get("nmap"):
-        rc, out = await runner.run(
-            f"nmap -Pn -p {port} --script rdp-ntlm-info,rdp-enum-encryption -oN /dev/stdout {host}",
-            f"{host}/rdp/rdp_nse.txt", "nmap-rdp")
-        scan_findings(out, "rdp", port, findings)
+        out = await _nmap_nse(host, port, "rdp-ntlm-info,rdp-enum-encryption", "rdp",
+                              runner, f"{host}/rdp", findings)
         m = re.search(r"(DNS_Domain_Name|Target_Name|NetBIOS_Domain_Name):\s*(\S+)", out or "")
         if m:
             findings.append(Finding("MEDIUM", "rdp", port, f"RDP NTLM info leaks: {m.group(2)}"))
