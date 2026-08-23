@@ -100,8 +100,9 @@ reconx-results/
 
 Add a service module: write `async def enum_x(host, port, runner, args, findings)`,
 run commands via `runner.run(cmd, outfile, label)`, append `Finding(...)` objects,
-then wire it into `dispatch()`. Add a detection: append a `(severity, regex,
-service, message)` tuple to `FINDING_RULES`. That's the whole extension surface.
+then wire it into `register_service_jobs()`. Add a detection: append a
+`(severity, regex, service, message)` tuple to `FINDING_RULES`. That's the
+whole extension surface.
 
 ## Exam-rules note
 
@@ -109,5 +110,3 @@ reconx only orchestrates standard enumeration tools — no automated *exploitati
 no mass vulnerability scanning. That keeps it on the right side of the OSCP tool
 policy, same category as AutoRecon. Always confirm against the current official
 OSCP Exam Guide before your attempt.
-```
-```
