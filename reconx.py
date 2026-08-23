@@ -874,8 +874,12 @@ FINDING_RULES = [
     ("CRITICAL", re.compile(r"Anonymous( FTP)? login (allowed|successful|ok)", re.I), "ftp", "Anonymous FTP login allowed"),
     ("CRITICAL", re.compile(r"\|_?ftp-anon:.*Anonymous", re.I), "ftp", "nmap confirms anonymous FTP"),
     ("HIGH",     re.compile(r"vsftpd 2\.3\.4", re.I), "ftp", "vsftpd 2.3.4 - backdoor (CVE-2011-2523)"),
-    ("CRITICAL", re.compile(r"NULL Session|Server allows session using username '', password ''", re.I), "smb", "SMB NULL session allowed"),
-    ("HIGH",     re.compile(r"\bSMBv1\b|SMB1 \(enabled\)|Signing (disabled|required:\s*False)", re.I), "smb", "SMB signing disabled / SMBv1 - relay & MS17-010 candidate"),
+    # Must match a *confirmed* null session, not just the phrase "null session"
+    # appearing in a failure message like "Could not establish null session: ...".
+    ("CRITICAL", re.compile(r"Server allows (?:session using|authenticat\w* via) username '',?\s*(?:password|and password) ''", re.I), "smb", "SMB NULL session allowed"),
+    # Must match an actual enabled/true value, not just the field name (e.g.
+    # netexec prints "(SMBv1:None)" / "(signing:True)" even when both are safe).
+    ("HIGH",     re.compile(r"SMBv1:\s*True\b|SMB1 \(enabled\)|SMB 1\.0:\s*true\b|SMB1 only:\s*true\b|signing:\s*False\b|SMB signing required:\s*false\b|Message signing enabled but not required|Message signing disabled", re.I), "smb", "SMB signing disabled / SMBv1 - relay & MS17-010 candidate"),
     ("HIGH",     re.compile(r"(READ|WRITE)(,|/| )?(WRITE)? on \\\\|Mapping: OK.*Listing: OK", re.I), "smb", "Readable/writable SMB share"),
     ("MEDIUM",   re.compile(r"\[\+\] Enumerating users", re.I), "smb", "User enumeration succeeded via RID/LSA"),
     ("HIGH",     re.compile(r"MS17-010|EternalBlue", re.I), "smb", "MS17-010 (EternalBlue) likely vulnerable"),
@@ -888,8 +892,11 @@ FINDING_RULES = [
     # like "admin/config" and any "word: word" text as false positives).
     ("HIGH",     re.compile(r"(?:^|[^a-zA-Z0-9])(password|passwd|pwd|secret|api[_-]?key|access[_-]?token)['\"]?\s*[:=]\s*['\"]?\S{3,}", re.I), "creds", "Possible default/leaked credential in output"),
     ("MEDIUM",   re.compile(r"robots\.txt", re.I), "http", "robots.txt present - inspect disallowed paths"),
-    ("HIGH",     re.compile(r"(phpmyadmin|/admin|wp-login|wp-admin|/manager/html|jenkins|gitlab|/api|/backup)", re.I), "http", "Interesting web path discovered"),
-    ("HIGH",     re.compile(r"(Apache Tomcat|Jenkins|GitLab|WordPress|Drupal|Joomla)[\s/]*([\d.]+)?", re.I), "http", "Notable web application detected"),
+    # (?<!\.) blocks matches touching a dot, so a "firstname.jenkins" or
+    # "firstname.gitlab"-style domain username (seen in SMB/LDAP user dumps)
+    # doesn't get misread as a Jenkins/GitLab web app or path.
+    ("HIGH",     re.compile(r"(?<!\.)(phpmyadmin|/admin|wp-login|wp-admin|/manager/html|jenkins|gitlab|/api|/backup)", re.I), "http", "Interesting web path discovered"),
+    ("HIGH",     re.compile(r"(?<!\.)(Apache Tomcat|Jenkins|GitLab|WordPress|Drupal|Joomla)[\s/]*([\d.]+)?", re.I), "http", "Notable web application detected"),
     ("MEDIUM",   re.compile(r"Server: .*(IIS|Apache|nginx)[/ ]([\d.]+)", re.I), "http", "Web server banner reveals version"),
     ("MEDIUM",   re.compile(r"(index of /|directory listing)", re.I), "http", "Directory listing enabled"),
     ("HIGH",     re.compile(r"snmp.*public|Community.*public|::public", re.I), "snmp", "SNMP community 'public' - walk it for creds/processes"),
