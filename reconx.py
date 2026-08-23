@@ -765,20 +765,15 @@ def have_creds(args):
                                                  or getattr(args, "hash", None)))
 
 
-def _sh_quote(s):
-    # single-quote for the shell; harmless for values without quotes, safe for those with
-    return "'" + str(s).replace("'", "'\\''") + "'"
-
-
 def nxc_auth(args):
     """Build the netexec/crackmapexec credential argument string from parsed args."""
-    parts = [f"-u {_sh_quote(args.user)}"]
+    parts = [f"-u {shlex.quote(args.user)}"]
     if getattr(args, "hash", None):
-        parts.append(f"-H {_sh_quote(args.hash)}")
+        parts.append(f"-H {shlex.quote(args.hash)}")
     else:
-        parts.append(f"-p {_sh_quote(args.password)}")
+        parts.append(f"-p {shlex.quote(args.password)}")
     if getattr(args, "domain", None):
-        parts.append(f"-d {_sh_quote(args.domain)}")
+        parts.append(f"-d {shlex.quote(args.domain)}")
     if getattr(args, "local_auth", False):
         parts.append("--local-auth")
     return " ".join(parts)
@@ -996,12 +991,12 @@ async def _impacket_roast_check(host, dom, runner, args, findings, tag, users_ou
     if spn_bin:
         user = f"{dom}/{args.user}"
         if getattr(args, "hash", None):
-            target, hash_flag = _sh_quote(user), f"-hashes {_sh_quote(args.hash)}"
+            target, hash_flag = shlex.quote(user), f"-hashes {shlex.quote(args.hash)}"
         else:
-            target, hash_flag = _sh_quote(f"{user}:{args.password}"), ""
+            target, hash_flag = shlex.quote(f"{user}:{args.password}"), ""
         out_file = os.path.abspath(os.path.join(loot_dir, "kerb_impacket.txt"))
         cmd = (f"{spn_bin} {target} {hash_flag} -dc-ip {host} -request "
-               f"-outputfile {_sh_quote(out_file)}").replace("  ", " ")
+               f"-outputfile {shlex.quote(out_file)}").replace("  ", " ")
         rc, out = await runner.run(cmd, f"{tag}/impacket_getuserspns.txt", "GetUserSPNs",
                                    timeout=args.enum_timeout)
         hits = sorted(set(_KRB5TGS_RX.findall(out or "")))
@@ -1017,8 +1012,8 @@ async def _impacket_roast_check(host, dom, runner, args, findings, tag, users_ou
             with open(users_file, "w") as f:
                 f.write("\n".join(users) + "\n")
         out_file = os.path.abspath(os.path.join(loot_dir, "asrep_impacket.txt"))
-        cmd = (f"{np_bin} {_sh_quote(dom + '/')} -usersfile {_sh_quote(users_file)} -no-pass "
-               f"-dc-ip {host} -request -outputfile {_sh_quote(out_file)}")
+        cmd = (f"{np_bin} {shlex.quote(dom + '/')} -usersfile {shlex.quote(users_file)} -no-pass "
+               f"-dc-ip {host} -request -outputfile {shlex.quote(out_file)}")
         rc, out = await runner.run(cmd, f"{tag}/impacket_getnpusers.txt", "GetNPUsers",
                                    timeout=args.enum_timeout)
         hits = sorted(set(_KRB5ASREP_RX.findall(out or "")))
@@ -1054,11 +1049,11 @@ async def enum_bloodhound(host, dom, runner, args, findings):
     if not runner.dry_run:
         os.makedirs(bh_dir, exist_ok=True)
     if getattr(args, "hash", None):
-        auth = f"--hashes {_sh_quote(args.hash)}"
+        auth = f"--hashes {shlex.quote(args.hash)}"
     else:
-        auth = f"-p {_sh_quote(args.password)}"
-    cmd = (f"cd {_sh_quote(bh_dir)} && {bin_name} -u {_sh_quote(args.user + '@' + dom)} {auth} "
-           f"-d {_sh_quote(dom)} -ns {host} -c All --zip")
+        auth = f"-p {shlex.quote(args.password)}"
+    cmd = (f"cd {shlex.quote(bh_dir)} && {bin_name} -u {shlex.quote(args.user + '@' + dom)} {auth} "
+           f"-d {shlex.quote(dom)} -ns {host} -c All --zip")
     outfile = f"{host}/ldap/bloodhound_collect.txt"
     rc, out = await runner.run(cmd, outfile, "bloodhound", timeout=args.scan_timeout)
     if rc == 0:
@@ -1108,8 +1103,8 @@ async def enum_ldap(host, port, runner, args, findings, queue):
                 os.makedirs(loot_dir, exist_ok=True)
             asrep_out = os.path.abspath(os.path.join(loot_dir, "asrep.txt"))
             kerb_out = os.path.abspath(os.path.join(loot_dir, "kerb.txt"))
-            for sub in ("--users", "--groups", f"--asreproast {_sh_quote(asrep_out)}",
-                        f"--kerberoasting {_sh_quote(kerb_out)}"):
+            for sub in ("--users", "--groups", f"--asreproast {shlex.quote(asrep_out)}",
+                        f"--kerberoasting {shlex.quote(kerb_out)}"):
                 rc, out = await runner.run(f"{nxc} ldap {host} {auth} {sub}",
                                            f"{tag}/auth_ldap_{sub.split()[0].strip('-')}.txt",
                                            f"{nxc} ldap {sub.split()[0]}")
@@ -1154,7 +1149,7 @@ async def enum_ssh(host, port, runner, args, findings):
     if have_creds(args) and not getattr(args, "hash", None):
         nxc = nxc_bin()
         if nxc:
-            rc, out = await runner.run(f"{nxc} ssh {host} -u {_sh_quote(args.user)} -p {_sh_quote(args.password)}",
+            rc, out = await runner.run(f"{nxc} ssh {host} -u {shlex.quote(args.user)} -p {shlex.quote(args.password)}",
                                        f"{tag}/auth_nxc_ssh.txt", "nxc-ssh")
             scan_findings(out, "ssh", port, findings)
             if out and ("[+]" in out or "Pwn3d" in out):
