@@ -1107,8 +1107,14 @@ async def _impacket_roast_check(host, dom, runner, args, findings, tag, users_ou
                 f"AS-REP roastable account(s) via GetNPUsers: {', '.join(hits)} - "
                 f"hash(es) saved to {out_file}, crack with hashcat -m 18200"))
 
-    # independent checks (different tools, no shared state) - run concurrently
-    await asyncio.gather(_run_getuserspns(), _run_getnpusers())
+    # independent checks (different tools, no shared state) - run concurrently.
+    # return_exceptions=True so a failure in one doesn't leave the other as an
+    # orphaned task that JobQueue never awaits/cleans up; re-raise afterwards
+    # so the failure still surfaces to the caller like it did when sequential.
+    results = await asyncio.gather(_run_getuserspns(), _run_getnpusers(), return_exceptions=True)
+    for r in results:
+        if isinstance(r, Exception):
+            raise r
     good(f"{host}: impacket kerberoast/asreproast cross-check done")
 
 
@@ -1962,6 +1968,10 @@ async def ping_sweep(hosts, args):
     return sorted(alive, key=lambda x: tuple(int(o) for o in x.split(".")) if x.count(".")==3 and all(o.isdigit() for o in x.split(".")) else (0,))
 
 
+# Hand-written, not generated from build_argparser() - a man page reads as
+# prose grouped by workflow (MODES, AUTHENTICATED MODE, ...), not a flat flag
+# dump like --help. That means it does NOT auto-track argparser changes:
+# keep it in sync by hand whenever a flag/default in build_argparser() changes.
 MANUAL = """
 RECONX(1)                        reconx manual                      RECONX(1)
 
