@@ -718,7 +718,14 @@ async def searchsploit_lookup(host, services, runner, args, findings):
                     f"searchsploit hit for '{term}': {titles}{more} - verify before use"))
                 return  # most-specific successful term wins; don't re-search broader terms
 
-    await asyncio.gather(*(check(p, m) for p, m in services.items()))
+    # return_exceptions=True: this is a best-effort correlation pass, so one
+    # port's check() raising shouldn't leave the other ports' checks running
+    # as orphaned tasks JobQueue never awaits/cleans up.
+    results = await asyncio.gather(*(check(p, m) for p, m in services.items()),
+                                   return_exceptions=True)
+    for r in results:
+        if isinstance(r, BaseException):
+            warn(f"{host}: searchsploit correlation failed for a service - {r}")
 
 
 async def udp_scan(host, runner, args):
@@ -1116,12 +1123,18 @@ async def _impacket_roast_check(host, dom, runner, args, findings, tag, users_ou
 
     # independent checks (different tools, no shared state) - run concurrently.
     # return_exceptions=True so a failure in one doesn't leave the other as an
-    # orphaned task that JobQueue never awaits/cleans up; re-raise afterwards
-    # so the failure still surfaces to the caller like it did when sequential.
+    # orphaned task that JobQueue never awaits/cleans up. Check BaseException,
+    # not Exception - asyncio.CancelledError is a BaseException (3.8+) and a
+    # cancelled child would otherwise be silently treated as a clean finish.
     results = await asyncio.gather(_run_getuserspns(), _run_getnpusers(), return_exceptions=True)
-    for r in results:
-        if isinstance(r, Exception):
-            raise r
+    errors = [r for r in results if isinstance(r, BaseException)]
+    for e in errors:
+        warn(f"{host}: kerberoast/asreproast check failed - {e}")
+    if errors:
+        real = next((e for e in errors if isinstance(e, Exception)), None)
+        if real:
+            raise real
+        return
     good(f"{host}: impacket kerberoast/asreproast cross-check done")
 
 
