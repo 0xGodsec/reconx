@@ -24,9 +24,11 @@ you'd run anyway, in parallel — you still do the thinking.
 - Python 3.8+ (standard library only — nothing to `pip install`)
 - Optional external tools (each degrades gracefully if absent):
   `rustscan`, `nmap`, `feroxbuster`/`gobuster`, `whatweb`, `nikto`,
-  `enum4linux-ng`, `nxc`/`netexec`, `smbclient`, `rpcclient`,
-  `ldapsearch`, `snmpwalk`, `onesixtyone`, `showmount`, `dig`, `curl`, `redis-cli`,
-  `smtp-user-enum`
+  `enum4linux-ng`/`enum4linux`, `nxc`/`netexec`/`crackmapexec`, `smbclient`,
+  `rpcclient`, `ldapsearch`, `snmpwalk`, `onesixtyone`, `showmount`, `dig`,
+  `curl`, `redis-cli`, `smtp-user-enum`, `psql`, `openssl`, `ncat`/`nc`,
+  `searchsploit`, `impacket` (`GetUserSPNs`/`GetNPUsers`, for Kerberoast /
+  AS-REP roast cross-checks), `bloodhound-python`/`bloodhound-ce-python`
 
 On Kali these are mostly preinstalled. reconx prints which it found and which it's skipping.
 
