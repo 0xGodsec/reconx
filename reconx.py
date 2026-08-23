@@ -148,9 +148,9 @@ TOOLS = {}
 def refresh_tools():
     for t in ("rustscan", "nmap", "whatweb", "feroxbuster", "gobuster", "nikto",
               "curl", "enum4linux-ng", "enum4linux", "nxc", "netexec", "crackmapexec",
-              "smbclient", "rpcclient", "ldapsearch", "nbtscan",
-              "snmpwalk", "onesixtyone", "showmount", "dig", "nslookup",
-              "hydra", "ssh", "redis-cli", "psql", "openssl", "ncat", "nc",
+              "smbclient", "rpcclient", "ldapsearch",
+              "snmpwalk", "onesixtyone", "showmount", "dig",
+              "redis-cli", "psql", "openssl", "ncat", "nc",
               "searchsploit",
               "impacket-GetUserSPNs", "GetUserSPNs.py",
               "impacket-GetNPUsers", "GetNPUsers.py",
