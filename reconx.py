@@ -1202,6 +1202,13 @@ def _smtp_userlist():
 
 _SMTP_ENUM_USER_RX = re.compile(r":\s*(\S+)\s+exists\b", re.I)
 
+# tried in order, most reliable/quietest first: VRFY works on most
+# misconfigured servers and is a single round-trip per user; EXPN (mailing
+# list expansion) and RCPT (probing MAIL/RCPT TO during a fake delivery) are
+# fallbacks for servers that disable VRFY (e.g. Postfix by default) but still
+# leak via one of the others.
+_SMTP_ENUM_MODES = ("VRFY", "EXPN", "RCPT")
+
 
 async def enum_smtp(host, port, runner, args, findings):
     tag = f"{host}/smtp"
@@ -1213,16 +1220,23 @@ async def enum_smtp(host, port, runner, args, findings):
     if TOOLS.get("smtp-user-enum"):
         userlist = _smtp_userlist()
         if userlist:
-            cmd = f"smtp-user-enum -m VRFY -U {shlex.quote(userlist)} -h {host} -p {port}"
-            rc2, out2 = await runner.run(cmd, f"{tag}/smtp-user-enum_vrfy.txt",
-                                         "smtp-user-enum", timeout=args.enum_timeout)
-            users = sorted(set(_SMTP_ENUM_USER_RX.findall(out2 or "")))
-            if users:
-                shown = ", ".join(users[:10])
-                more = f" (+{len(users) - 10} more)" if len(users) > 10 else ""
-                findings.append(Finding("HIGH", "smtp", port,
-                    f"SMTP user enumeration (VRFY) confirmed account(s): {shown}{more} - "
-                    f"reuse as usernames against SSH/web/mail login"))
+            for mode in _SMTP_ENUM_MODES:
+                cmd = f"smtp-user-enum -m {mode} -U {shlex.quote(userlist)} -h {host} -p {port}"
+                if mode == "RCPT" and getattr(args, "domain", None):
+                    # RCPT TO:<user> alone only works when the server does
+                    # local delivery unqualified; give it user@domain too
+                    # (needed for Exchange-style targets) whenever we know one.
+                    cmd += f" -D {shlex.quote(args.domain)}"
+                rc2, out2 = await runner.run(cmd, f"{tag}/smtp-user-enum_{mode.lower()}.txt",
+                                             f"smtp-user-enum-{mode.lower()}", timeout=args.enum_timeout)
+                users = sorted(set(_SMTP_ENUM_USER_RX.findall(out2 or "")))
+                if users:
+                    shown = ", ".join(users[:10])
+                    more = f" (+{len(users) - 10} more)" if len(users) > 10 else ""
+                    findings.append(Finding("HIGH", "smtp", port,
+                        f"SMTP user enumeration ({mode}) confirmed account(s): {shown}{more} - "
+                        f"reuse as usernames against SSH/web/mail login"))
+                    break  # first successful mode wins; no need to probe weaker methods too
         else:
             findings.append(Finding("INFO", "smtp", port,
                 "smtp-user-enum installed but no username wordlist found - user enum skipped"))
