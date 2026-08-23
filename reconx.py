@@ -261,6 +261,17 @@ class Runner:
                     except ProcessLookupError:
                         pass
                     warn(f"timeout ({label}) after {timeout or self.timeout}s")
+                    if managed_outfile and outfile:
+                        # the tool may have already written partial results to
+                        # its own -o file before being killed; remove them so a
+                        # later --resume doesn't mistake the truncated output
+                        # for a completed scan (missing outfile == never ran).
+                        path = os.path.join(self.outdir, outfile)
+                        for p in (path, path + ".reconx-meta.json"):
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
                     return 124, ""
                 text = out.decode(errors="replace") if out else ""
                 if outfile and not managed_outfile:
@@ -620,7 +631,8 @@ async def service_scan(host, ports, runner, args):
 
     plist = ",".join(str(p) for p in ports)
     scripts = "" if args.no_scripts else "-sC"
-    intensity = getattr(args, "version_intensity", None) or 6
+    intensity = getattr(args, "version_intensity", None)
+    intensity = 6 if intensity is None else intensity
     cmd = (f"nmap -Pn -sV {scripts} -p {plist} --version-intensity {intensity} "
            f"-oN /dev/stdout {host}")
     info(f"service/version detection on {len(ports)} port(s) via nmap -sCV")
@@ -827,6 +839,24 @@ def _nxc_login_ok(out):
     return bool(out) and ("[+]" in out or "Pwn3d" in out)
 
 
+async def _nxc_authed_check(nxc, service, host, port, runner, findings, args,
+                             outfile, label, extra="", auth=None,
+                             success=None, on_fail=None):
+    """Run a single authenticated netexec check, log it as a finding via
+    scan_findings, and append `success`/`on_fail` Finding(s) depending on
+    whether the login was confirmed. Returns True if the login worked."""
+    auth = nxc_auth(args) if auth is None else auth
+    cmd = f"{nxc} {service} {host} {auth} {extra}".strip()
+    rc, out = await runner.run(cmd, outfile, label)
+    scan_findings(out, service, port, findings)
+    ok = _nxc_login_ok(out)
+    if ok and success:
+        findings.append(success)
+    elif not ok and on_fail:
+        findings.append(on_fail)
+    return ok
+
+
 def cred_label(args):
     who = args.user
     if getattr(args, "domain", None):
@@ -1011,7 +1041,7 @@ def _impacket_bin(name):
 
 
 _NXC_USER_ROW_RX = re.compile(r"^\S+\s+\S+\s+\d+\s+\S+\s+(\S+)\s+(?:\d{4}-\d{2}-\d{2}|<never>)", re.M)
-_KRB5TGS_RX = re.compile(r"\$krb5tgs\$\d+\$\*?([^\s*]+)")
+_KRB5TGS_RX = re.compile(r"\$krb5tgs\$\d+\$\*?([^\s*$]+)")
 _KRB5ASREP_RX = re.compile(r"\$krb5asrep\$\d+\$([^\s:]+)")
 
 
@@ -1039,7 +1069,9 @@ async def _impacket_roast_check(host, dom, runner, args, findings, tag, users_ou
             "impacket's GetUserSPNs/GetNPUsers not found - Kerberoast/AS-REP cross-check skipped"))
         return
 
-    if spn_bin:
+    async def _run_getuserspns():
+        if not spn_bin:
+            return
         user = f"{dom}/{args.user}"
         if getattr(args, "hash", None):
             target, hash_flag = shlex.quote(user), f"-hashes {shlex.quote(args.hash)}"
@@ -1056,8 +1088,10 @@ async def _impacket_roast_check(host, dom, runner, args, findings, tag, users_ou
                 f"Kerberoastable account(s) via GetUserSPNs: {', '.join(hits)} - "
                 f"hash(es) saved to {out_file}, crack with hashcat -m 13100"))
 
-    users = sorted(set(_NXC_USER_ROW_RX.findall(users_out or "")))
-    if np_bin and users:
+    async def _run_getnpusers():
+        users = sorted(set(_NXC_USER_ROW_RX.findall(users_out or "")))
+        if not (np_bin and users):
+            return
         users_file = os.path.join(loot_dir, "_candidate_users.txt")
         if not runner.dry_run:
             with open(users_file, "w") as f:
@@ -1072,6 +1106,9 @@ async def _impacket_roast_check(host, dom, runner, args, findings, tag, users_ou
             findings.append(Finding("CRITICAL", "ldap", None,
                 f"AS-REP roastable account(s) via GetNPUsers: {', '.join(hits)} - "
                 f"hash(es) saved to {out_file}, crack with hashcat -m 18200"))
+
+    # independent checks (different tools, no shared state) - run concurrently
+    await asyncio.gather(_run_getuserspns(), _run_getnpusers())
     good(f"{host}: impacket kerberoast/asreproast cross-check done")
 
 
@@ -1191,11 +1228,10 @@ async def enum_ssh(host, port, runner, args, findings):
     if have_creds(args) and not getattr(args, "hash", None):
         nxc = nxc_bin()
         if nxc:
-            rc, out = await runner.run(f"{nxc} ssh {host} -u {shlex.quote(args.user)} -p {shlex.quote(args.password)}",
-                                       f"{tag}/auth_nxc_ssh.txt", "nxc-ssh")
-            scan_findings(out, "ssh", port, findings)
-            if _nxc_login_ok(out):
-                findings.append(Finding("CRITICAL", "ssh", port,
+            await _nxc_authed_check(nxc, "ssh", host, port, runner, findings, args,
+                f"{tag}/auth_nxc_ssh.txt", "nxc-ssh",
+                auth=f"-u {shlex.quote(args.user)} -p {shlex.quote(args.password)}",
+                success=Finding("CRITICAL", "ssh", port,
                     f"SSH login works: ssh {args.user}@{host}  (then sudo -l, id, enumerate)"))
     good("ssh enum done")
 
@@ -1332,12 +1368,9 @@ async def enum_nfs(host, runner, args, findings):
 async def enum_mssql(host, port, runner, args, findings):
     nxc = nxc_bin()
     if nxc and have_creds(args):
-        auth = nxc_auth(args)
-        rc, out = await runner.run(f"{nxc} mssql {host} {auth} -x whoami",
-                                   f"{host}/mssql/auth_nxc.txt", "nxc-mssql-auth")
-        scan_findings(out, "mssql", port, findings)
-        if _nxc_login_ok(out):
-            findings.append(Finding("CRITICAL", "mssql", port,
+        await _nxc_authed_check(nxc, "mssql", host, port, runner, findings, args,
+            f"{host}/mssql/auth_nxc.txt", "nxc-mssql-auth", extra="-x whoami",
+            success=Finding("CRITICAL", "mssql", port,
                 "MSSQL login works - enable xp_cmdshell for RCE (nxc mssql ... -x whoami / mssqlclient.py)"))
     elif nxc:
         rc, out = await runner.run(f"{nxc} mssql {host} -u sa -p '' --local-auth",
@@ -1445,15 +1478,12 @@ async def enum_winrm(host, port, runner, args, findings):
     if have_creds(args):
         nxc = nxc_bin()
         if nxc:
-            rc, out = await runner.run(f"{nxc} winrm {host} {nxc_auth(args)}",
-                                       f"{host}/winrm/auth_nxc.txt", "nxc-winrm-auth")
-            scan_findings(out, "winrm", port, findings)
-            if _nxc_login_ok(out):
-                pw = "-H <hash>" if getattr(args, "hash", None) else "-p <pass>"
-                findings.append(Finding("CRITICAL", "winrm", port,
-                    f"WinRM login works -> SHELL: evil-winrm -i {host} -u {args.user} {pw}"))
-            else:
-                findings.append(Finding("INFO", "winrm", port,
+            pw = "-H <hash>" if getattr(args, "hash", None) else "-p <pass>"
+            await _nxc_authed_check(nxc, "winrm", host, port, runner, findings, args,
+                f"{host}/winrm/auth_nxc.txt", "nxc-winrm-auth",
+                success=Finding("CRITICAL", "winrm", port,
+                    f"WinRM login works -> SHELL: evil-winrm -i {host} -u {args.user} {pw}"),
+                on_fail=Finding("INFO", "winrm", port,
                     "WinRM open - supplied credential did not confirm a login (see auth_nxc.txt)"))
         else:
             findings.append(Finding("MEDIUM", "winrm", port,
@@ -1473,11 +1503,9 @@ async def enum_rdp(host, port, runner, args, findings):
     if have_creds(args):
         nxc = nxc_bin()
         if nxc:
-            rc, out = await runner.run(f"{nxc} rdp {host} {nxc_auth(args)}",
-                                       f"{host}/rdp/auth_nxc.txt", "nxc-rdp-auth")
-            scan_findings(out, "rdp", port, findings)
-            if _nxc_login_ok(out):
-                findings.append(Finding("HIGH", "rdp", port,
+            await _nxc_authed_check(nxc, "rdp", host, port, runner, findings, args,
+                f"{host}/rdp/auth_nxc.txt", "nxc-rdp-auth",
+                success=Finding("HIGH", "rdp", port,
                     f"RDP login works: xfreerdp /u:{args.user} /p:<pass> /v:{host} /cert:ignore"))
 
 
@@ -1850,6 +1878,9 @@ async def scan_host(host, runner, args):
                  "NOTES.md will be refreshed when they finish")
         await queue.wait_all_done()
         if not runner.dry_run and queue.had_background_jobs:
+            elapsed = time.time() - t0
+            print_summary(host, host_state["services"], host_state["udp"], findings,
+                          host_profile, elapsed, args)
             write_markdown(host, host_state["services"], host_state["udp"], findings,
                            runner.outdir, host_profile)
             good(f"{host}: background modules finished - notes updated")
