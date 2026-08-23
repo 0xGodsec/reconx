@@ -25,7 +25,8 @@ you'd run anyway, in parallel — you still do the thinking.
 - Optional external tools (each degrades gracefully if absent):
   `rustscan`, `nmap`, `feroxbuster`/`gobuster`, `whatweb`, `nikto`,
   `enum4linux-ng`, `nxc`/`netexec`, `smbclient`, `rpcclient`,
-  `ldapsearch`, `snmpwalk`, `onesixtyone`, `showmount`, `dig`, `curl`, `redis-cli`
+  `ldapsearch`, `snmpwalk`, `onesixtyone`, `showmount`, `dig`, `curl`, `redis-cli`,
+  `smtp-user-enum`
 
 On Kali these are mostly preinstalled. reconx prints which it found and which it's skipping.
 
