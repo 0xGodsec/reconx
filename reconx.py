@@ -1192,13 +1192,52 @@ async def enum_smtp(host, port, runner, args, findings):
 
 
 async def enum_dns(host, port, runner, args, findings):
+    """Version/PTR probe, then AXFR (zone transfer) attempts against every
+    domain we can find: an explicit -d/--domain, and whatever the reverse
+    PTR lookup suggests (strip the leftmost label off the PTR hostname to
+    guess its zone). A misconfigured NS handing out a full zone on an
+    unauthenticated AXFR is a common, high-value miss if left as a manual
+    step."""
     tag = f"{host}/dns"
-    if TOOLS.get("dig"):
-        rc, out = await runner.run(f"dig @{host} version.bind chaos txt +short",
-                                   f"{tag}/version.txt", "dig-version")
-        # zone transfer attempt against any domain we can guess from reverse
-        rc2, out2 = await runner.run(f"dig @{host} -x {host} +short", f"{tag}/ptr.txt", "dig-ptr")
-        good("dns basic checks done (add AXFR manually once you know the domain)")
+    if not TOOLS.get("dig"):
+        return
+    rc, out = await runner.run(f"dig @{host} -p {port} version.bind chaos txt +short",
+                               f"{tag}/version.txt", "dig-version")
+    rc2, out2 = await runner.run(f"dig @{host} -p {port} -x {host} +short",
+                                 f"{tag}/ptr.txt", "dig-ptr")
+
+    domains = []
+    if getattr(args, "domain", None):
+        domains.append(args.domain)
+    for line in (out2 or "").splitlines():
+        ptr = line.strip().rstrip(".")
+        if not ptr:
+            continue
+        labels = ptr.split(".")
+        if len(labels) > 2:
+            domains.append(".".join(labels[1:]))  # strip host label -> guessed zone
+        elif len(labels) == 2:
+            domains.append(ptr)
+
+    tried = set()
+    for dom in domains:
+        dom = dom.lower()
+        if dom in tried:
+            continue
+        tried.add(dom)
+        rc3, out3 = await runner.run(
+            f"dig @{host} -p {port} {dom} axfr +time=10 +tries=1",
+            f"{tag}/axfr_{dom}.txt", "dig-axfr", timeout=30)
+        if out3 and "XFR size:" in out3:
+            findings.append(Finding("CRITICAL", "dns", port,
+                f"DNS zone transfer (AXFR) succeeded for '{dom}' - full zone dumped, "
+                f"see {tag}/axfr_{dom}.txt"))
+
+    if tried:
+        good(f"dns checks done (AXFR tried against: {', '.join(sorted(tried))})")
+    else:
+        good("dns basic checks done (no domain known yet to try AXFR against - "
+             "pass -d/--domain, or add AXFR manually once you know the domain)")
 
 
 async def enum_nfs(host, runner, args, findings):
