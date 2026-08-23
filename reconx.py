@@ -41,7 +41,6 @@ import re
 import shlex
 import shutil
 import signal
-import socket
 import sys
 import time
 from datetime import datetime
@@ -518,13 +517,10 @@ async def discover_ports(host, runner, args):
     # Full range unless --quick/--top-ports narrows it.
     if args.quick:
         port_list = TOP_1000
-        rustscan_range = "--top"
     elif args.top_ports:
         port_list = TOP_1000[: args.top_ports] if args.top_ports <= len(TOP_1000) else range(1, 65536)
-        rustscan_range = None
     else:
         port_list = range(1, 65536)
-        rustscan_range = None
 
     if TOOLS.get("rustscan") and not args.no_rustscan:
         info(f"port discovery via rustscan ({'top 1000' if args.quick else 'full range'})")
@@ -1638,7 +1634,6 @@ def print_summary(host, services, udp, findings, host_profile, elapsed, args=Non
 
 def suggest_next(services, findings, host_profile, args=None):
     steps = []
-    sev_present = {f.sev for f in findings}
     svc_present = {f.service for f in findings}
     ports = set(services)
 
