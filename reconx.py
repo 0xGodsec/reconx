@@ -1962,9 +1962,181 @@ async def ping_sweep(hosts, args):
     return sorted(alive, key=lambda x: tuple(int(o) for o in x.split(".")) if x.count(".")==3 and all(o.isdigit() for o in x.split(".")) else (0,))
 
 
+MANUAL = """
+RECONX(1)                        reconx manual                      RECONX(1)
+
+NAME
+    reconx - lean, fast, accurate recon orchestrator (AutoRecon alternative)
+
+SYNOPSIS
+    reconx TARGET [options]
+
+DESCRIPTION
+    reconx discovers open ports fast, confirms them for accuracy with
+    nmap -sCV, runs targeted per-service enumeration concurrently, then
+    prints a ranked "look at this first" summary instead of burying you
+    in hundreds of loose files. TARGET is an IP, hostname, or CIDR range
+    (e.g. 10.10.10.10, target.htb, 10.10.10.0/24).
+
+    Only use this against systems you're authorized to test: your own
+    lab, HTB/PG/THM, or written permission.
+
+HOW A SCAN RUNS
+    1. Discovery      rustscan if installed, else a built-in async TCP
+                       connect sweep (all 65535 ports by default). If the
+                       first pass finds 0 open ports, reconx retries once
+                       at lower concurrency before reporting the host down
+                       (bursts of connections can trip rate-limiting).
+    2. Accuracy pass   nmap -sCV on the confirmed ports for real service
+                       and version info, with a UDP scan running alongside.
+    3. Enumeration     per-service modules run concurrently as ports are
+                       confirmed: web (whatweb/ferox/gobuster/nikto), SMB
+                       and AD (netexec/enum4linux-ng/smbclient/ldapsearch),
+                       remote access (FTP/SSH/RDP/WinRM), databases
+                       (MSSQL/PostgreSQL/Redis), SNMP, SMTP/POP3/IMAP,
+                       NFS, DNS.
+    4. Findings        regex rules classify tool output into CRITICAL /
+                       HIGH / MEDIUM / INFO, deduplicated and ranked.
+    5. Output          colored terminal summary + a NOTES.md per host,
+                       ready to drop into your report.
+
+MODES  (--mode quick|full|deep, default: full)
+    quick   top-1000 ports only, no UDP, no nmap -sC scripts. For a first
+            pass across many hosts. Same as passing --quick.
+    full    all 65535 TCP ports, UDP scan, nmap -sC scripts. The default.
+    deep    like full, plus nikto and heavier vuln-scan scripts turned on
+            automatically, and the largest dirbrute wordlist available.
+
+BASIC OPTIONS
+    -o, --outdir DIR       where results are written (default: reconx-results)
+    --mode MODE             quick | full | deep (see MODES above)
+    --quick                 shorthand for --mode quick
+    --top-ports N           scan only the top N common ports
+    --no-udp                skip the UDP scan
+    --no-scripts             nmap -sV only, skip -sC
+    --no-rustscan           force the built-in async scanner over rustscan
+    --nikto                 run nikto on web ports (noisy, runs in background)
+    --ping-sweep            liveness-check a CIDR before scanning it
+    --wordlist PATH          override the dirbrute wordlist
+    --dry-run                print the command plan, run nothing
+    --resume                skip jobs already completed under outdir/host/,
+                            so a Ctrl-C or crash doesn't cost you the work
+                            already done - just re-run the same command
+    -v, --verbose            echo every external command as it runs
+    --no-color               disable colored output
+
+AUTHENTICATED MODE
+    Feed reconx a credential and the SMB/WinRM/LDAP/MSSQL/SSH/Postgres
+    modules re-run authenticated: checking access, admin rights (Pwn3d!),
+    shares, users, and AD Kerberoast/AS-REP roasting, printing the exact
+    follow-up command (evil-winrm, xfreerdp, BloodHound, ...) the moment a
+    login is confirmed to work.
+
+    -u, --user NAME         username for authenticated enumeration
+    -p, --pass PASS         password (use --hash instead for NTLM)
+    -H, --hash HASH         NTLM hash for pass-the-hash (LM:NT or :NT)
+    -d, --domain DOMAIN     AD domain (e.g. corp.htb)
+    --local-auth            treat the credential as a LOCAL account, not
+                            a domain account
+    --spray                 test the ONE supplied credential across every
+                            host in a CIDR via SMB/WinRM, then stop
+                            (doesn't full-scan the whole range)
+    --bloodhound            once authenticated to LDAP, also run a full
+                            bloodhound-python -c All collection in the
+                            background (needs bloodhound-python installed)
+
+    Credential reuse is the fastest path from foothold to root. --spray
+    only ever tries a single credential (never a list) and stops on
+    STATUS_ACCOUNT_LOCKED_OUT, but confirm the target's lockout policy
+    before spraying a domain account regardless. Authenticated checks
+    need netexec (nxc) installed.
+
+TUNING / ADVANCED
+    --concurrency N          async port-scan concurrency (default 800; if
+                            discovery finds 0 ports, reconx auto-retries
+                            once at a lower value before giving up)
+    --parallel N              max concurrent external commands (default 6)
+    --workers N                enum job-queue worker count (default 8)
+    --version-intensity N      nmap --version-intensity for -sCV (0-9;
+                              default 6, 9 in --mode deep)
+    --host-timeout SECONDS     per-port connect timeout (default 1.5)
+    --scan-timeout SECONDS      port/service scan timeout (default 1800)
+    --enum-timeout SECONDS       per-enum-module timeout (default 600)
+    --timeout SECONDS             default command timeout (default 900)
+    --no-exploit-search           skip searchsploit correlation
+
+OUTPUT LAYOUT
+    reconx-results/
+    +-- 10.10.10.10/
+        +-- scans/       rustscan, nmap service, nmap udp
+        +-- web_80/      whatweb, headers, robots, ferox/gobuster, nikto
+        +-- smb/         netexec, enum4linux-ng, smbclient
+        +-- ldap/        rootdse dump, anon dump, kerberoast/asrep loot
+        +-- ftp/ ssh/ snmp/ nfs/ ...
+        +-- NOTES.md     ports table + ranked findings, ready for your report
+
+EXAMPLES
+    reconx 10.10.10.10
+        single host, full pipeline
+
+    reconx 10.10.10.10 --quick
+        fast top-1000-port pass
+
+    reconx 10.10.10.0/24 --ping-sweep --quick
+        sweep a subnet, then quick-scan whatever answers
+
+    reconx target.htb --nikto -o loot/
+        add nikto, write results under loot/ instead of reconx-results/
+
+    reconx 10.10.10.10 --dry-run
+        see the exact command plan without running anything
+
+    reconx 10.10.10.10 --resume
+        pick up an interrupted scan where it left off
+
+    reconx dc01.corp.htb -u alex.turner -p 'Passw0rd!' -d corp.htb
+        authenticated AD enumeration with a domain credential
+
+    reconx 10.10.10.5 -u admin -H <LM:NT> --local-auth
+        pass-the-hash against a local account
+
+    reconx 10.10.10.0/24 -u svc -p 'S3cret!' --spray
+        spray one credential across a subnet, then stop
+
+    reconx dc01.corp.htb -u alex.turner -p 'Passw0rd!' -d corp.htb --bloodhound
+        authenticated enum plus a full BloodHound collection
+
+REQUIREMENTS
+    Python 3.8+, standard library only. Everything else (rustscan, nmap,
+    feroxbuster/gobuster, nxc/netexec, enum4linux-ng, impacket, ...) is
+    optional - reconx prints what it found and what it's skipping, and
+    each module degrades gracefully when its tool is missing.
+
+SEE ALSO
+    reconx --help    for the flag reference in short form
+    README.md        for the full writeup and extension guide
+
+    Authorized targets only.
+"""
+
+
 # --------------------------------------------------------------------------- #
 #  Main
 # --------------------------------------------------------------------------- #
+class _ManAction(argparse.Action):
+    """Prints the full manual and exits immediately, the same way argparse's
+    built-in -h/--help does - so `reconx --man` works even without a target
+    positional (its required-ness is only checked *after* parsing)."""
+
+    def __init__(self, option_strings, dest, help=None):
+        super().__init__(option_strings=option_strings, dest=dest,
+                         nargs=0, default=argparse.SUPPRESS, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(MANUAL)
+        parser.exit()
+
+
 def build_argparser():
     p = argparse.ArgumentParser(
         prog="reconx",
@@ -1978,6 +2150,8 @@ def build_argparser():
                "  reconx 10.10.10.0/24 -u svc -H <ntlm-hash> --spray\n"
                "  reconx 10.10.10.10 --dry-run",
     )
+    p.add_argument("--man", action=_ManAction,
+                   help="show the full manual (usage guide + examples) and exit")
     p.add_argument("target", help="IP, hostname, or CIDR (e.g. 10.10.10.0/24)")
     p.add_argument("-o", "--outdir", default="reconx-results", help="output directory")
     # --- credentials (authorized testing only) ---

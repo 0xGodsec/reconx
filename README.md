@@ -35,6 +35,7 @@ On Kali these are mostly preinstalled. reconx prints which it found and which it
 ## Usage
 
 ```bash
+python3 reconx.py --man                       # full manual: modes, all flags, examples
 python3 reconx.py 10.10.10.10                 # single host, full pipeline
 python3 reconx.py 10.10.10.10 --quick         # top-1000 ports, fast
 python3 reconx.py 10.10.10.0/24 --ping-sweep  # sweep a subnet first
