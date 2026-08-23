@@ -799,6 +799,11 @@ def nxc_bin():
     return _first_tool("nxc", "netexec", "crackmapexec")
 
 
+def _nxc_login_ok(out):
+    """True if netexec/crackmapexec output confirms a working login."""
+    return bool(out) and ("[+]" in out or "Pwn3d" in out)
+
+
 def cred_label(args):
     who = args.user
     if getattr(args, "domain", None):
@@ -1166,7 +1171,7 @@ async def enum_ssh(host, port, runner, args, findings):
             rc, out = await runner.run(f"{nxc} ssh {host} -u {shlex.quote(args.user)} -p {shlex.quote(args.password)}",
                                        f"{tag}/auth_nxc_ssh.txt", "nxc-ssh")
             scan_findings(out, "ssh", port, findings)
-            if out and ("[+]" in out or "Pwn3d" in out):
+            if _nxc_login_ok(out):
                 findings.append(Finding("CRITICAL", "ssh", port,
                     f"SSH login works: ssh {args.user}@{host}  (then sudo -l, id, enumerate)"))
     good("ssh enum done")
@@ -1308,7 +1313,7 @@ async def enum_mssql(host, port, runner, args, findings):
         rc, out = await runner.run(f"{nxc} mssql {host} {auth} -x whoami",
                                    f"{host}/mssql/auth_nxc.txt", "nxc-mssql-auth")
         scan_findings(out, "mssql", port, findings)
-        if out and ("[+]" in out or "Pwn3d" in out):
+        if _nxc_login_ok(out):
             findings.append(Finding("CRITICAL", "mssql", port,
                 "MSSQL login works - enable xp_cmdshell for RCE (nxc mssql ... -x whoami / mssqlclient.py)"))
     elif nxc:
@@ -1420,7 +1425,7 @@ async def enum_winrm(host, port, runner, args, findings):
             rc, out = await runner.run(f"{nxc} winrm {host} {nxc_auth(args)}",
                                        f"{host}/winrm/auth_nxc.txt", "nxc-winrm-auth")
             scan_findings(out, "winrm", port, findings)
-            if out and ("[+]" in out or "Pwn3d" in out):
+            if _nxc_login_ok(out):
                 pw = "-H <hash>" if getattr(args, "hash", None) else "-p <pass>"
                 findings.append(Finding("CRITICAL", "winrm", port,
                     f"WinRM login works -> SHELL: evil-winrm -i {host} -u {args.user} {pw}"))
@@ -1448,7 +1453,7 @@ async def enum_rdp(host, port, runner, args, findings):
             rc, out = await runner.run(f"{nxc} rdp {host} {nxc_auth(args)}",
                                        f"{host}/rdp/auth_nxc.txt", "nxc-rdp-auth")
             scan_findings(out, "rdp", port, findings)
-            if out and ("[+]" in out or "Pwn3d" in out):
+            if _nxc_login_ok(out):
                 findings.append(Finding("HIGH", "rdp", port,
                     f"RDP login works: xfreerdp /u:{args.user} /p:<pass> /v:{host} /cert:ignore"))
 
