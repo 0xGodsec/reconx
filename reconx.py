@@ -1972,7 +1972,10 @@ def build_argparser():
     p.add_argument("--ping-sweep", action="store_true", help="liveness-check a CIDR first")
     p.add_argument("--wordlist", default=None,
                    help="dirbrute wordlist (default: auto-detect, mode-aware)")
-    p.add_argument("--concurrency", type=int, default=800, help="async scan concurrency")
+    p.add_argument("--concurrency", type=int, default=800,
+                   help="async scan concurrency (auto-retries once at a lower "
+                        "concurrency if the first pass finds 0 ports, in case "
+                        "a rate-limiting host/firewall dropped the burst)")
     p.add_argument("--parallel", type=int, default=6, help="max concurrent external commands")
     p.add_argument("--workers", type=int, default=8,
                    help="job-queue worker pool size (how many modules run at once)")

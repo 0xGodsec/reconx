@@ -78,7 +78,10 @@ installed; without the flag reconx just prints the manual command to run).
 ## How it works
 
 1. **Discovery** — rustscan if present, else a built-in async TCP connect sweep
-   (full 65535 by default). Fast.
+   (full 65535 by default). Fast. If the first pass finds 0 open ports, reconx
+   retries once at a much lower concurrency before reporting the host as
+   down — a burst of hundreds of simultaneous connections can trip a host's
+   or firewall's rate-limiting and silently drop every probe.
 2. **Accuracy pass** — `nmap -sCV` on *confirmed* ports for real service/version,
    with a top-100 UDP scan in parallel.
 3. **Targeted enumeration** — dispatches per-service modules concurrently:
