@@ -2067,10 +2067,10 @@ async def amain(args):
     print(C.CY + BANNER + C.END)
     info(f"mode: {C.M}{args.mode}{C.END}  workers: {args.workers}  parallel: {args.parallel}")
     missing = [t for t in ("rustscan", "nmap", "feroxbuster", "gobuster", "whatweb",
-                           "enum4linux-ng", "nxc", "netexec") if not TOOLS.get(t)]
+                           "enum4linux-ng", "nxc", "netexec", "smtp-user-enum") if not TOOLS.get(t)]
     have = [t for t in ("rustscan", "nmap", "feroxbuster", "gobuster", "whatweb",
                         "enum4linux-ng", "nxc", "netexec", "smbclient", "ldapsearch",
-                        "snmpwalk", "curl") if TOOLS.get(t)]
+                        "snmpwalk", "curl", "smtp-user-enum") if TOOLS.get(t)]
     info(f"tools available: {C.G}{', '.join(have) or 'none'}{C.END}")
     if missing:
         warn(f"missing (modules will degrade/skip): {C.DIM}{', '.join(missing)}{C.END}")
