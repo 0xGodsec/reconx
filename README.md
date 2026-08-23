@@ -38,11 +38,14 @@ python3 reconx.py 10.10.10.10 --quick         # top-1000 ports, fast
 python3 reconx.py 10.10.10.0/24 --ping-sweep  # sweep a subnet first
 python3 reconx.py target.htb --nikto -o loot/ # add nikto, custom output dir
 python3 reconx.py 10.10.10.10 --dry-run       # print the command plan, run nothing
+python3 reconx.py 10.10.10.10 --resume        # pick up an interrupted scan where it left off
 ```
 
 Handy flags: `--no-udp`, `--no-scripts` (skip nmap `-sC`), `--no-rustscan`
 (force built-in scanner), `--top-ports N`, `--wordlist PATH`, `--parallel N`,
-`-v` (echo every command), `--no-color`.
+`-v` (echo every command), `--no-color`, `--resume` (skip jobs already
+completed in `<outdir>/<host>/`, so a Ctrl-C or crash mid-scan doesn't cost
+you the work already done).
 
 ### Authenticated mode (once you have a credential)
 
@@ -55,11 +58,15 @@ BloodHound) when a login works.
 reconx dc01.corp.htb -u alex.turner -p 'Passw0rd!' -d corp.htb   # domain creds
 reconx 10.10.10.5 -u admin -H <LM:NT> --local-auth               # pass-the-hash
 reconx 10.10.10.0/24 -u svc -p 'S3cret!' --spray                 # spray one cred
+reconx dc01.corp.htb -u alex.turner -p 'Passw0rd!' -d corp.htb --bloodhound  # + full BloodHound collection
 ```
 
 Credential flags: `-u/--user`, `-p/--pass`, `-H/--hash` (NTLM PtH),
 `-d/--domain`, `--local-auth` (local account, not domain), `--spray` (test the
-**one** credential across every host in a CIDR via SMB/WinRM).
+**one** credential across every host in a CIDR via SMB/WinRM), `--bloodhound`
+(once authenticated to LDAP, run a full `bloodhound-python -c All` collection
+in the background — needs `bloodhound-python`/`bloodhound-ce-python`
+installed; without the flag reconx just prints the manual command to run).
 
 > Credential reuse is the fastest path from foothold to root. reconx sprays a
 > **single** credential (never a list) and stops on `STATUS_ACCOUNT_LOCKED_OUT`,
