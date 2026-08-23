@@ -158,6 +158,22 @@ def refresh_tools():
         TOOLS[t] = which(t)
 
 
+def _first_tool(*candidates):
+    """Return the first candidate binary name found installed, or None."""
+    for cand in candidates:
+        if TOOLS.get(cand):
+            return cand
+    return None
+
+
+def _first_existing_file(candidates):
+    """Return the first candidate path that exists on disk, or None."""
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
 # --------------------------------------------------------------------------- #
 #  Command runner
 # --------------------------------------------------------------------------- #
@@ -780,8 +796,7 @@ def nxc_auth(args):
 
 
 def nxc_bin():
-    return "nxc" if TOOLS.get("nxc") else ("netexec" if TOOLS.get("netexec")
-            else ("crackmapexec" if TOOLS.get("crackmapexec") else None))
+    return _first_tool("nxc", "netexec", "crackmapexec")
 
 
 def cred_label(args):
@@ -964,10 +979,7 @@ def _dn_to_domain(dn):
 def _impacket_bin(name):
     """Kali packages these as impacket-<Name>; some installs keep the raw
     <Name>.py script name instead - try both, skip gracefully if neither."""
-    for cand in (f"impacket-{name}", f"{name}.py"):
-        if TOOLS.get(cand):
-            return cand
-    return None
+    return _first_tool(f"impacket-{name}", f"{name}.py")
 
 
 _NXC_USER_ROW_RX = re.compile(r"^\S+\s+\S+\s+\d+\s+\S+\s+(\S+)\s+(?:\d{4}-\d{2}-\d{2}|<never>)", re.M)
@@ -1036,10 +1048,7 @@ async def _impacket_roast_check(host, dom, runner, args, findings, tag, users_ou
 
 
 def _bloodhound_bin():
-    for cand in ("bloodhound-python", "bloodhound-ce-python"):
-        if TOOLS.get(cand):
-            return cand
-    return None
+    return _first_tool("bloodhound-python", "bloodhound-ce-python")
 
 
 async def enum_bloodhound(host, dom, runner, args, findings):
@@ -1190,10 +1199,7 @@ _SMTP_USER_WORDLISTS = [
 
 
 def _smtp_userlist():
-    for cand in _SMTP_USER_WORDLISTS:
-        if os.path.isfile(cand):
-            return cand
-    return None
+    return _first_existing_file(_SMTP_USER_WORDLISTS)
 
 
 _SMTP_ENUM_USER_RX = re.compile(r":\s*(\S+)\s+exists\b", re.I)
@@ -1999,10 +2005,10 @@ def resolve_wordlist(args):
         return
     candidates = {"quick": QUICK_WORDLISTS, "deep": DEEP_WORDLISTS}.get(
         getattr(args, "mode", None), DEFAULT_WORDLISTS)
-    for cand in candidates:
-        if os.path.isfile(cand):
-            args.wordlist = cand
-            return
+    found = _first_existing_file(candidates)
+    if found:
+        args.wordlist = found
+        return
     warn("no default dirbrute wordlist found - pass --wordlist PATH (dirbrute will be skipped)")
 
 
