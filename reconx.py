@@ -703,6 +703,142 @@ async def udp_scan(host, runner, args):
 
 
 # --------------------------------------------------------------------------- #
+#  CLDAP (Connectionless LDAP over UDP 389)
+#
+#  ldapsearch speaks TCP only, so the TCP enum_ldap() path never touches
+#  UDP 389. CLDAP matters for two reasons: (1) it leaks the same rootDSE
+#  domain info (naming context, DC hostname) even when TCP 389/636 is
+#  filtered, and (2) an open, publicly-reachable CLDAP responder is a
+#  well-known reflection/amplification DDoS source worth flagging. This is
+#  a self-contained pure-Python probe - no external tool needed, so it
+#  degrades in exactly the opposite direction from the ldapsearch path.
+# --------------------------------------------------------------------------- #
+def _ber_len(n):
+    """BER definite-length octets (short form < 128, else long form)."""
+    if n < 0x80:
+        return bytes([n])
+    body = b""
+    while n:
+        body = bytes([n & 0xFF]) + body
+        n >>= 8
+    return bytes([0x80 | len(body)]) + body
+
+
+def _ber_tlv(tag, value):
+    return bytes([tag]) + _ber_len(len(value)) + value
+
+
+# rootDSE operational attributes are only returned when asked for by name.
+_CLDAP_ATTRS = (b"defaultNamingContext", b"namingContexts",
+                b"rootDomainNamingContext", b"dnsHostName",
+                b"supportedLDAPVersion", b"supportedSASLMechanisms",
+                b"serverName", b"ldapServiceName")
+
+
+def _cldap_rootdse_query(msgid=1, base=b""):
+    """BER-encode an LDAP searchRequest for the rootDSE, suitable for a
+    single-datagram CLDAP query."""
+    attrs = _ber_tlv(0x30, b"".join(_ber_tlv(0x04, a) for a in _CLDAP_ATTRS))
+    search = b"".join((
+        _ber_tlv(0x04, base),          # baseObject ""
+        _ber_tlv(0x0A, b"\x00"),       # scope: baseObject
+        _ber_tlv(0x0A, b"\x00"),       # derefAliases: neverDerefAliases
+        _ber_tlv(0x02, b"\x00"),       # sizeLimit 0
+        _ber_tlv(0x02, b"\x00"),       # timeLimit 0
+        _ber_tlv(0x01, b"\x00"),       # typesOnly FALSE
+        _ber_tlv(0x87, b"objectClass"),  # filter: present (objectClass=*)
+        attrs,
+    ))
+    proto = _ber_tlv(0x63, search)     # searchRequest [APPLICATION 3]
+    msg = _ber_tlv(0x02, bytes([msgid])) + proto  # messageID + protocolOp
+    return _ber_tlv(0x30, msg)         # LDAPMessage SEQUENCE
+
+
+def _printable_strings(data, minlen=3):
+    """Pull runs of printable ASCII out of a raw BER response so the shared
+    regex-based scan_findings() rules can read it. CLDAP rootDSE values
+    (DN strings, hostnames) are printable OCTET STRINGs, so this recovers
+    everything we care about without a full BER parser."""
+    out, cur = [], []
+    for b in data:
+        if 0x20 <= b < 0x7F:
+            cur.append(chr(b))
+        else:
+            if len(cur) >= minlen:
+                out.append("".join(cur))
+            cur = []
+    if len(cur) >= minlen:
+        out.append("".join(cur))
+    return "\n".join(out)
+
+
+async def cldap_probe(host, port=389, timeout=3.0):
+    """Send one CLDAP rootDSE query over UDP and return the raw response
+    bytes, or None on timeout / no responder."""
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+
+    class _Proto(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):
+            if not fut.done():
+                fut.set_result(data)
+
+        def error_received(self, exc):
+            if not fut.done():
+                fut.set_exception(exc)
+
+    try:
+        transport, _ = await loop.create_datagram_endpoint(
+            _Proto, remote_addr=(host, port))
+    except OSError:
+        return None
+    try:
+        transport.sendto(_cldap_rootdse_query())
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        except (asyncio.TimeoutError, OSError):
+            return None
+    finally:
+        transport.close()
+
+
+async def cldap_enum(host, port, runner, args, findings):
+    """Probe CLDAP on UDP `port`, record the rootDSE leak, and flag the
+    responder as a reflection/amplification source."""
+    if runner.dry_run:
+        runner.plan.append(("cldap-rootdse", f"cldap-probe udp://{host}:{port}",
+                            f"{host}/ldap/cldap_rootdse.txt"))
+        return
+    info(f"CLDAP rootDSE probe on udp/{port}")
+    data = await cldap_probe(host, port)
+    if not data:
+        return
+    text = _printable_strings(data)
+    outdir = os.path.join(runner.outdir, host, "ldap")
+    try:
+        os.makedirs(outdir, exist_ok=True)
+        with open(os.path.join(outdir, "cldap_rootdse.txt"), "w") as f:
+            f.write(f"# CLDAP rootDSE response from udp/{port} ({len(data)} bytes)\n\n")
+            f.write(text + "\n")
+    except OSError:
+        pass
+    # a responder that answers our unauthenticated single-datagram query is
+    # itself the finding (CLDAP reflection/amplification exposure)...
+    findings.append(Finding("MEDIUM", "ldap", port,
+        f"CLDAP responder on udp/{port} - unauthenticated rootDSE leak / "
+        f"reflection-amplification DDoS source"))
+    # ...and the rootDSE body leaks AD domain structure just like TCP LDAP.
+    scan_findings(text, "ldap", port, findings)
+    base = re.search(r"DC=[^\s]+(?:,DC=[^\s]+)+", text, re.I)
+    if base:
+        dom = _dn_to_domain(base.group(0))
+        findings.append(Finding("HIGH", "ldap", port,
+            f"CLDAP naming context: {base.group(0)}"
+            + (f" (domain {dom})" if dom else "")))
+    good("cldap enum done")
+
+
+# --------------------------------------------------------------------------- #
 #  Service classification
 # --------------------------------------------------------------------------- #
 COMMON = {
@@ -1693,7 +1829,7 @@ async def job_discover(host, runner, args, queue, findings, host_profile, host_s
         coro_factory=functools.partial(job_service_scan, host, ports, runner, args,
                                         queue, findings, host_profile, host_state, state_store)))
     queue.add_job(Job(f"{host}:udp_scan", PRIO_SCAN, background=True,
-        coro_factory=functools.partial(job_udp_scan, host, runner, args, host_state, state_store)))
+        coro_factory=functools.partial(job_udp_scan, host, runner, args, findings, host_state, state_store)))
     if args.mode == "deep" and TOOLS.get("nmap"):
         queue.add_job(Job(f"{host}:vuln_scan", PRIO_BACKGROUND, background=True,
             coro_factory=functools.partial(job_vuln_scan, host, ports, runner, args, findings)))
@@ -1721,11 +1857,20 @@ async def job_service_scan(host, ports, runner, args, queue, findings, host_prof
     return services
 
 
-async def job_udp_scan(host, runner, args, host_state, state_store):
+async def job_udp_scan(host, runner, args, findings, host_state, state_store):
     udp = await udp_scan(host, runner, args)
     host_state["udp"] = udp
     if state_store:
         await state_store.save_ports_services(udp=udp)
+    # CLDAP rides on UDP 389 (and, rarely, the global-catalog port 3268).
+    # ldapsearch can't reach it, so probe it here once the UDP scan has
+    # confirmed the port is open. Dry-run still records the plan entry.
+    if not args.no_udp:
+        for cldap_port in (389, 3268):
+            if runner.dry_run or cldap_port in udp:
+                await cldap_enum(host, cldap_port, runner, args, findings)
+                if runner.dry_run:
+                    break  # one plan entry is enough to show the module
     return udp
 
 
@@ -1912,7 +2057,10 @@ HOW A SCAN RUNS
                        at lower concurrency before reporting the host down
                        (bursts of connections can trip rate-limiting).
     2. Accuracy pass   nmap -sCV on the confirmed ports for real service
-                       and version info, with a UDP scan running alongside.
+                       and version info, with a UDP scan running alongside
+                       (top-100, or all 65535 with --udp-full). If UDP 389
+                       is open, a pure-Python CLDAP rootDSE probe leaks the
+                       AD naming context that ldapsearch (TCP-only) can't.
     3. Enumeration     per-service modules run concurrently as ports are
                        confirmed: SMB
                        and AD (netexec/enum4linux-ng/smbclient/ldapsearch),
@@ -1993,7 +2141,7 @@ OUTPUT LAYOUT
     +-- 10.10.10.10/
         +-- scans/       rustscan, nmap service, nmap udp
         +-- smb/         netexec, enum4linux-ng, smbclient
-        +-- ldap/        rootdse dump, anon dump, kerberoast/asrep loot
+        +-- ldap/        rootdse dump, anon dump, CLDAP rootdse, kerberoast/asrep loot
         +-- ftp/ ssh/ snmp/ nfs/ ...
         +-- NOTES.md     ports table + ranked findings, ready for your report
 
