@@ -683,8 +683,13 @@ async def searchsploit_lookup(host, services, runner, args, findings):
 async def udp_scan(host, runner, args):
     if args.no_udp or not TOOLS.get("nmap"):
         return {}
-    info("top-100 UDP scan via nmap (background; slow by nature)")
-    cmd = f"nmap -Pn -sU --top-ports 100 --open -oN /dev/stdout {host}"
+    if args.udp_full:
+        info("full-range (65535) UDP scan via nmap (background; very slow by nature)")
+        scope = "-p-"
+    else:
+        info("top-100 UDP scan via nmap (background; slow by nature)")
+        scope = "--top-ports 100"
+    cmd = f"nmap -Pn -sU {scope} --open -oN /dev/stdout {host}"
     rc, out = await runner.run(cmd, outfile=f"{host}/scans/nmap_udp.txt",
                                label="nmap-udp", timeout=args.scan_timeout)
     if runner.dry_run:
@@ -1932,6 +1937,7 @@ BASIC OPTIONS
     --quick                 shorthand for --mode quick
     --top-ports N           scan only the top N common ports
     --no-udp                skip the UDP scan
+    --udp-full              scan all 65535 UDP ports instead of the top 100 (very slow)
     --no-scripts             nmap -sV only, skip -sC
     --no-rustscan           force the built-in async scanner over rustscan
     --ping-sweep            liveness-check a CIDR before scanning it
@@ -2085,6 +2091,8 @@ def build_argparser():
     p.add_argument("--quick", action="store_true", help="top-1000 ports only (fast); shorthand for --mode quick")
     p.add_argument("--top-ports", type=int, help="scan only the top N common ports")
     p.add_argument("--no-udp", action="store_true", help="skip UDP scan")
+    p.add_argument("--udp-full", action="store_true",
+                   help="scan all 65535 UDP ports instead of the top 100 (very slow)")
     p.add_argument("--no-scripts", action="store_true", help="nmap -sV only, no -sC")
     p.add_argument("--no-rustscan", action="store_true", help="force built-in async scanner")
     p.add_argument("--bloodhound", action="store_true",
