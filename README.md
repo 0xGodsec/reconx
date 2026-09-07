@@ -12,7 +12,7 @@ accuracy, runs *targeted* per-service enumeration concurrently, then prints a
 | Problem with heavy scanners | What reconx does |
 |---|---|
 | Dumps hundreds of files; you drown | Ranks findings by severity, tells you what matters |
-| Slow (UDP + nikto + full wordlists on everything) | Lean curated commands per service; heavy stuff is opt-in |
+| Slow (UDP + full wordlists on everything) | Lean curated commands per service; heavy stuff is opt-in |
 | Silent failures look like "nothing there" | Flags missing tools and degrades gracefully |
 | Hard to hack mid-exam | Single Python file, stdlib only, readable |
 
@@ -23,8 +23,7 @@ you'd run anyway, in parallel — you still do the thinking.
 
 - Python 3.8+ (standard library only — nothing to `pip install`)
 - Optional external tools (each degrades gracefully if absent):
-  `rustscan`, `nmap`, `feroxbuster`/`gobuster`, `whatweb`, `nikto`,
-  `enum4linux-ng`/`enum4linux`, `nxc`/`netexec`/`crackmapexec`, `smbclient`,
+  `rustscan`, `nmap`, `enum4linux-ng`/`enum4linux`, `nxc`/`netexec`/`crackmapexec`, `smbclient`,
   `rpcclient`, `ldapsearch`, `snmpwalk`, `onesixtyone`, `showmount`, `dig`,
   `curl`, `redis-cli`, `smtp-user-enum`, `psql`, `openssl`, `ncat`/`nc`,
   `searchsploit`, `impacket` (`GetUserSPNs`/`GetNPUsers`, for Kerberoast /
@@ -39,13 +38,13 @@ python3 reconx.py --man                       # full manual: modes, all flags, e
 python3 reconx.py 10.10.10.10                 # single host, full pipeline
 python3 reconx.py 10.10.10.10 --quick         # top-1000 ports, fast
 python3 reconx.py 10.10.10.0/24 --ping-sweep  # sweep a subnet first
-python3 reconx.py target.htb --nikto -o loot/ # add nikto, custom output dir
+python3 reconx.py target.htb -o loot/         # custom output dir
 python3 reconx.py 10.10.10.10 --dry-run       # print the command plan, run nothing
 python3 reconx.py 10.10.10.10 --resume        # pick up an interrupted scan where it left off
 ```
 
 Handy flags: `--no-udp`, `--no-scripts` (skip nmap `-sC`), `--no-rustscan`
-(force built-in scanner), `--top-ports N`, `--wordlist PATH`, `--parallel N`,
+(force built-in scanner), `--top-ports N`, `--parallel N`,
 `-v` (echo every command), `--no-color`, `--resume` (skip jobs already
 completed in `<outdir>/<host>/`, so a Ctrl-C or crash mid-scan doesn't cost
 you the work already done).
@@ -86,7 +85,6 @@ installed; without the flag reconx just prints the manual command to run).
 2. **Accuracy pass** — `nmap -sCV` on *confirmed* ports for real service/version,
    with a top-100 UDP scan in parallel.
 3. **Targeted enumeration** — dispatches per-service modules concurrently:
-   - **Web** (80/443/8080/…): whatweb, robots.txt, feroxbuster/gobuster, opt nikto
    - **SMB/AD** (139/445/389/88): netexec shares+users, enum4linux-ng, smbclient, ldapsearch anon dump, DC detection
    - **Remote access** (21/22/23/3389/5985): FTP anon, SSH NSE, RDP NTLM info, WinRM note
    - **DB & misc** (1433/5432/6379/161/25/53/2049): MSSQL, **PostgreSQL** (default-cred sweep + psql probe), Redis, SNMP walk, SMTP user-enum, NFS exports, DNS
@@ -102,7 +100,6 @@ installed; without the flag reconx just prints the manual command to run).
 reconx-results/
 └── 10.10.10.10/
     ├── scans/        rustscan, nmap service, nmap udp
-    ├── web_80/       whatweb, headers, robots, ferox/gobuster, nikto
     ├── smb/          netexec, enum4linux-ng, smbclient
     ├── ldap/         rootdse, anon dump
     ├── ftp/ ssh/ snmp/ nfs/ ...
