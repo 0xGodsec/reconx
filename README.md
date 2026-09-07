@@ -43,7 +43,8 @@ python3 reconx.py 10.10.10.10 --dry-run       # print the command plan, run noth
 python3 reconx.py 10.10.10.10 --resume        # pick up an interrupted scan where it left off
 ```
 
-Handy flags: `--no-udp`, `--no-scripts` (skip nmap `-sC`), `--no-rustscan`
+Handy flags: `--no-udp`, `--udp-full` (all 65535 UDP ports instead of the
+top 100; very slow), `--no-scripts` (skip nmap `-sC`), `--no-rustscan`
 (force built-in scanner), `--top-ports N`, `--parallel N`,
 `-v` (echo every command), `--no-color`, `--resume` (skip jobs already
 completed in `<outdir>/<host>/`, so a Ctrl-C or crash mid-scan doesn't cost
@@ -83,7 +84,9 @@ installed; without the flag reconx just prints the manual command to run).
    down — a burst of hundreds of simultaneous connections can trip a host's
    or firewall's rate-limiting and silently drop every probe.
 2. **Accuracy pass** — `nmap -sCV` on *confirmed* ports for real service/version,
-   with a top-100 UDP scan in parallel.
+   with a top-100 UDP scan in parallel (use `--udp-full` for all 65535). If
+   UDP 389 is open, a pure-Python CLDAP rootDSE probe leaks the AD naming
+   context/DC hostname that TCP-only `ldapsearch` can't reach.
 3. **Targeted enumeration** — dispatches per-service modules concurrently:
    - **SMB/AD** (139/445/389/88): netexec shares+users, enum4linux-ng, smbclient, ldapsearch anon dump, DC detection
    - **Remote access** (21/22/23/3389/5985): FTP anon, SSH NSE, RDP NTLM info, WinRM note
@@ -101,7 +104,7 @@ reconx-results/
 └── 10.10.10.10/
     ├── scans/        rustscan, nmap service, nmap udp
     ├── smb/          netexec, enum4linux-ng, smbclient
-    ├── ldap/         rootdse, anon dump
+    ├── ldap/         rootdse, anon dump, CLDAP rootdse
     ├── ftp/ ssh/ snmp/ nfs/ ...
     └── NOTES.md      ports table + ranked findings, ready for your notes
 ```
