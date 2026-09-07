@@ -145,7 +145,7 @@ def which(name):
 
 TOOLS = {}
 def refresh_tools():
-    for t in ("rustscan", "nmap", "whatweb", "feroxbuster", "gobuster", "nikto",
+    for t in ("rustscan", "nmap",
               "curl", "enum4linux-ng", "enum4linux", "nxc", "netexec", "crackmapexec",
               "smbclient", "rpcclient", "ldapsearch",
               "snmpwalk", "onesixtyone", "showmount", "dig",
@@ -187,13 +187,8 @@ class Runner:
         self.plan = []          # for --dry-run
         self.sem = None         # set once loop exists
 
-    async def run(self, cmd, outfile=None, label=None, timeout=None, managed_outfile=False):
-        """Run a shell command, tee output to a file, return (rc, stdout+stderr).
-
-        managed_outfile=True means cmd itself writes to `outfile` (e.g.
-        feroxbuster's own -o flag) rather than us capturing stdout - we only
-        use `outfile` for --resume detection and to recover output if stdout
-        was empty, and never overwrite what the command wrote."""
+    async def run(self, cmd, outfile=None, label=None, timeout=None):
+        """Run a shell command, tee output to a file, return (rc, stdout+stderr)."""
         label = label or cmd.split()[0]
         if self.dry_run:
             self.plan.append((label, cmd, outfile))
@@ -202,40 +197,20 @@ class Runner:
             path = os.path.join(self.outdir, outfile)
             if os.path.isfile(path) and os.path.getsize(path) > 0:
                 stale = False
-                cached = None
-                if not managed_outfile:
-                    with open(path, errors="replace") as f:
-                        cached = f.read()
-                    # strip the "# cmd: ...\n\n" header we write below, if present,
-                    # and use it to detect a changed command (e.g. --mode/--wordlist
-                    # changed since the cached file was written) rather than
-                    # blindly trusting whatever's on disk at this path.
-                    if cached.startswith("# cmd:") and "\n\n" in cached:
-                        header, rest = cached.split("\n\n", 1)
-                        if header[len("# cmd: "):] != cmd:
-                            stale = True
-                        cached = rest
-                else:
-                    # managed-outfile tools (feroxbuster -o, ...) don't write a
-                    # header themselves, so we keep a small sidecar recording
-                    # the command that produced them. A missing sidecar means
-                    # an older reconx wrote this file - trust the cache rather
-                    # than treat pre-existing loot as stale.
-                    meta_path = path + ".reconx-meta.json"
-                    if os.path.isfile(meta_path):
-                        try:
-                            with open(meta_path) as f:
-                                meta = json.load(f)
-                            if meta.get("cmd") != cmd:
-                                stale = True
-                        except (ValueError, OSError):
-                            pass
+                with open(path, errors="replace") as f:
+                    cached = f.read()
+                # strip the "# cmd: ...\n\n" header we write below, if present,
+                # and use it to detect a changed command (e.g. --mode changed
+                # since the cached file was written) rather than blindly
+                # trusting whatever's on disk at this path.
+                if cached.startswith("# cmd:") and "\n\n" in cached:
+                    header, rest = cached.split("\n\n", 1)
+                    if header[len("# cmd: "):] != cmd:
+                        stale = True
+                    cached = rest
                 if not stale:
                     if self.verbose:
                         info(f"resume: {C.DIM}skipping {label}, using cached {path}{C.END}")
-                    if managed_outfile:
-                        with open(path, errors="replace") as f:
-                            cached = f.read()
                     return 0, cached
                 if self.verbose:
                     info(f"resume: {C.DIM}cached {path} is from a different command, re-running {label}{C.END}")
@@ -254,43 +229,20 @@ class Runner:
                         proc.communicate(), timeout=timeout or self.timeout)
                 except asyncio.TimeoutError:
                     # cmd runs via a shell, so proc.kill() would only kill the
-                    # shell - tools that fork workers (ferox, enum4linux-ng, ...) keep
+                    # shell - tools that fork workers (enum4linux-ng, nmap NSE, ...) keep
                     # running. Kill the whole process group instead.
                     try:
                         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                     warn(f"timeout ({label}) after {timeout or self.timeout}s")
-                    if managed_outfile and outfile:
-                        # the tool may have already written partial results to
-                        # its own -o file before being killed; remove them so a
-                        # later --resume doesn't mistake the truncated output
-                        # for a completed scan (missing outfile == never ran).
-                        path = os.path.join(self.outdir, outfile)
-                        for p in (path, path + ".reconx-meta.json"):
-                            try:
-                                os.remove(p)
-                            except OSError:
-                                pass
                     return 124, ""
                 text = out.decode(errors="replace") if out else ""
-                if outfile and not managed_outfile:
+                if outfile:
                     path = os.path.join(self.outdir, outfile)
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                     with open(path, "w", errors="replace") as f:
                         f.write(f"# cmd: {cmd}\n\n{text}")
-                elif managed_outfile:
-                    path = os.path.join(self.outdir, outfile)
-                    if not text and os.path.isfile(path):
-                        # cmd's own -o file is the only place its results landed
-                        with open(path, errors="replace") as f:
-                            text = f.read()
-                    if os.path.isfile(path):
-                        try:
-                            with open(path + ".reconx-meta.json", "w") as f:
-                                json.dump({"cmd": cmd}, f)
-                        except OSError:
-                            pass
                 return proc.returncode, text
             except FileNotFoundError:
                 bad(f"command not found: {cmd.split()[0]}")
@@ -409,7 +361,7 @@ class JobQueue:
     but never queued for execution - its coroutine is never entered at all.
 
     "Core" jobs (background=False) gate wait_core_done(); background jobs
-    (udp/nikto/vuln-scan) run alongside everything else without
+    (udp/vuln-scan) run alongside everything else without
     blocking it. wait_all_done() waits for every job, core or background.
     """
 
@@ -941,13 +893,6 @@ def scan_findings(text, default_service, port, findings):
 # --------------------------------------------------------------------------- #
 #  Enumeration modules - each returns nothing, appends to findings list
 # --------------------------------------------------------------------------- #
-def _web_target(host, port, name):
-    scheme = "https" if (port in (443, 8443, 5986) or "https" in name or "ssl" in name) else "http"
-    base = f"{scheme}://{host}:{port}"
-    tag = f"{host}/web_{port}"
-    return scheme, base, tag
-
-
 async def _nmap_nse(host, port, scripts, proto, runner, tag, findings, timeout=None):
     """Run an nmap NSE script set against one port, save output to
     <tag>/<proto>_nse.txt, and scan it into findings. Returns the raw output
@@ -957,56 +902,6 @@ async def _nmap_nse(host, port, scripts, proto, runner, tag, findings, timeout=N
         f"{tag}/{proto}_nse.txt", f"nmap-{proto}", timeout=timeout)
     scan_findings(out, proto, port, findings)
     return out
-
-
-async def enum_web(host, port, name, runner, args, findings):
-    scheme, base, tag = _web_target(host, port, name)
-
-    # whatweb / curl headers
-    if TOOLS.get("whatweb"):
-        rc, out = await runner.run(f"whatweb -a3 {base}", f"{tag}/whatweb.txt", "whatweb")
-        scan_findings(out, "http", port, findings)
-    elif TOOLS.get("curl"):
-        rc, out = await runner.run(f"curl -skI {base}", f"{tag}/headers.txt", "curl-head")
-        scan_findings(out, "http", port, findings)
-
-    # robots.txt
-    if TOOLS.get("curl"):
-        rc, out = await runner.run(f"curl -sk {base}/robots.txt", f"{tag}/robots.txt", "robots")
-        if out and "<html" not in out.lower() and out.strip():
-            findings.append(Finding("MEDIUM", "http", port, "robots.txt present - inspect disallowed paths"))
-
-    # directory brute force (feroxbuster preferred, gobuster fallback)
-    wl = args.wordlist
-    if not wl:
-        pass
-    elif TOOLS.get("feroxbuster"):
-        recurse = "" if getattr(args, "mode", None) == "deep" else "--no-recursion"
-        cmd = (f"feroxbuster -u {base} -w {wl} -t 50 -q {recurse} "
-               f"-s 200,204,301,302,307,401,403 -o {os.path.join(runner.outdir, tag, 'ferox.txt')}")
-        rc, out = await runner.run(cmd, f"{tag}/ferox.txt", "feroxbuster",
-                                   timeout=args.enum_timeout, managed_outfile=True)
-        scan_findings(out, "http", port, findings)
-    elif TOOLS.get("gobuster"):
-        cmd = f"gobuster dir -u {base} -w {wl} -t 50 -q -k"
-        rc, out = await runner.run(cmd, f"{tag}/gobuster.txt", "gobuster", timeout=args.enum_timeout)
-        scan_findings(out, "http", port, findings)
-    else:
-        warn(f"no feroxbuster/gobuster - skipping dirbrute on {base}")
-
-    good(f"web enum done: {base}")
-
-
-async def enum_nikto(host, port, name, runner, args, findings):
-    """Runs standalone as a background job so it never delays whatweb/
-    dirbrute/robots.txt findings behind its own slow scan."""
-    scheme, base, tag = _web_target(host, port, name)
-    if not TOOLS.get("nikto"):
-        return
-    rc, out = await runner.run(f"nikto -host {base} -maxtime {args.enum_timeout}s",
-                               f"{tag}/nikto.txt", "nikto", timeout=args.enum_timeout + 30)
-    scan_findings(out, "http", port, findings)
-    good(f"nikto done: {base}")
 
 
 async def enum_smb(host, runner, args, findings):
@@ -1585,13 +1480,7 @@ def register_service_jobs(queue, host, services, runner, args, findings, host_pr
     for port, meta in sorted(services.items()):
         name = meta.get("name", guess_service(port))
 
-        if is_web(port, name):
-            queue.add_job(Job(f"{host}:web:{port}", prio("web"), background=False,
-                coro_factory=functools.partial(enum_web, host, port, name, runner, args, findings)))
-            if args.nikto:
-                queue.add_job(Job(f"{host}:nikto:{port}", PRIO_BACKGROUND, background=True,
-                    coro_factory=functools.partial(enum_nikto, host, port, name, runner, args, findings)))
-        elif port in (139, 445) or "microsoft-ds" in name or "netbios" in name:
+        if port in (139, 445) or "microsoft-ds" in name or "netbios" in name:
             queue.add_job(Job(f"{host}:smb", prio("smb"), background=False,
                 coro_factory=functools.partial(enum_smb, host, runner, args, findings)))
         elif port in (389, 636, 3268, 3269) or "ldap" in name:
@@ -1720,7 +1609,7 @@ def suggest_next(services, findings, host_profile, args=None):
     if 445 in ports or 139 in ports:
         steps.append("SMB: list shares with null/guest, mount readable ones, grep for passwords & scripts.")
     if any(is_web(p, services[p].get('name','')) for p in ports):
-        steps.append("Web: read the dirbrute output, hit 401/403/interesting paths, check source & default creds.")
+        steps.append("Web: run your own web enum (whatweb/feroxbuster/nikto), hit 401/403/interesting paths, check source & default creds.")
     if 22 in ports:
         steps.append("SSH: no shell yet - only useful once you harvest a username+password/key elsewhere.")
     if "snmp" in svc_present:
@@ -1900,7 +1789,7 @@ async def scan_host(host, runner, args):
             good(f"notes written: {md}")
 
         if queue.had_background_jobs:
-            info("background modules (udp/nikto/vuln-scan) still running - "
+            info("background modules (udp/vuln-scan) still running - "
                  "NOTES.md will be refreshed when they finish")
         await queue.wait_all_done()
         if not runner.dry_run and queue.had_background_jobs:
@@ -2020,7 +1909,7 @@ HOW A SCAN RUNS
     2. Accuracy pass   nmap -sCV on the confirmed ports for real service
                        and version info, with a UDP scan running alongside.
     3. Enumeration     per-service modules run concurrently as ports are
-                       confirmed: web (whatweb/ferox/gobuster/nikto), SMB
+                       confirmed: SMB
                        and AD (netexec/enum4linux-ng/smbclient/ldapsearch),
                        remote access (FTP/SSH/RDP/WinRM), databases
                        (MSSQL/PostgreSQL/Redis), SNMP, SMTP/POP3/IMAP,
@@ -2034,8 +1923,8 @@ MODES  (--mode quick|full|deep, default: full)
     quick   top-1000 ports only, no UDP, no nmap -sC scripts. For a first
             pass across many hosts. Same as passing --quick.
     full    all 65535 TCP ports, UDP scan, nmap -sC scripts. The default.
-    deep    like full, plus nikto and heavier vuln-scan scripts turned on
-            automatically, and the largest dirbrute wordlist available.
+    deep    like full, plus heavier vuln-scan scripts turned on
+            automatically and a higher nmap version-detection intensity.
 
 BASIC OPTIONS
     -o, --outdir DIR       where results are written (default: reconx-results)
@@ -2045,9 +1934,7 @@ BASIC OPTIONS
     --no-udp                skip the UDP scan
     --no-scripts             nmap -sV only, skip -sC
     --no-rustscan           force the built-in async scanner over rustscan
-    --nikto                 run nikto on web ports (noisy, runs in background)
     --ping-sweep            liveness-check a CIDR before scanning it
-    --wordlist PATH          override the dirbrute wordlist
     --dry-run                print the command plan, run nothing
     --resume                skip jobs already completed under outdir/host/,
                             so a Ctrl-C or crash doesn't cost you the work
@@ -2099,7 +1986,6 @@ OUTPUT LAYOUT
     reconx-results/
     +-- 10.10.10.10/
         +-- scans/       rustscan, nmap service, nmap udp
-        +-- web_80/      whatweb, headers, robots, ferox/gobuster, nikto
         +-- smb/         netexec, enum4linux-ng, smbclient
         +-- ldap/        rootdse dump, anon dump, kerberoast/asrep loot
         +-- ftp/ ssh/ snmp/ nfs/ ...
@@ -2115,8 +2001,8 @@ EXAMPLES
     reconx 10.10.10.0/24 --ping-sweep --quick
         sweep a subnet, then quick-scan whatever answers
 
-    reconx target.htb --nikto -o loot/
-        add nikto, write results under loot/ instead of reconx-results/
+    reconx target.htb -o loot/
+        write results under loot/ instead of reconx-results/
 
     reconx 10.10.10.10 --dry-run
         see the exact command plan without running anything
@@ -2138,7 +2024,7 @@ EXAMPLES
 
 REQUIREMENTS
     Python 3.8+, standard library only. Everything else (rustscan, nmap,
-    feroxbuster/gobuster, nxc/netexec, enum4linux-ng, impacket, ...) is
+    nxc/netexec, enum4linux-ng, impacket, ...) is
     optional - reconx prints what it found and what it's skipping, and
     each module degrades gracefully when its tool is missing.
 
@@ -2175,7 +2061,7 @@ def build_argparser():
         epilog="Authorized targets only. Examples:\n"
                "  reconx 10.10.10.10\n"
                "  reconx 10.10.10.0/24 --ping-sweep --quick\n"
-               "  reconx target.htb --nikto -o loot/\n"
+               "  reconx target.htb -o loot/\n"
                "  reconx dc01.corp.htb -u alex.turner -p 'Passw0rd!' -d corp.htb\n"
                "  reconx 10.10.10.0/24 -u svc -H <ntlm-hash> --spray\n"
                "  reconx 10.10.10.10 --dry-run",
@@ -2195,18 +2081,15 @@ def build_argparser():
                     help="spray the ONE credential across all hosts (CIDR) via SMB/WinRM")
     p.add_argument("--mode", choices=("quick", "full", "deep"), default=None,
                    help="scan profile: quick (fast, no UDP/scripts), full (default), "
-                        "deep (bigger wordlist, nikto+vuln-scripts auto-on)")
+                        "deep (heavier vuln-scan scripts auto-on)")
     p.add_argument("--quick", action="store_true", help="top-1000 ports only (fast); shorthand for --mode quick")
     p.add_argument("--top-ports", type=int, help="scan only the top N common ports")
     p.add_argument("--no-udp", action="store_true", help="skip UDP scan")
     p.add_argument("--no-scripts", action="store_true", help="nmap -sV only, no -sC")
     p.add_argument("--no-rustscan", action="store_true", help="force built-in async scanner")
-    p.add_argument("--nikto", action="store_true", help="run nikto on web ports (noisy, backgrounded)")
     p.add_argument("--bloodhound", action="store_true",
                    help="run a full BloodHound collection (-c All) against an authenticated LDAP target (backgrounded)")
     p.add_argument("--ping-sweep", action="store_true", help="liveness-check a CIDR first")
-    p.add_argument("--wordlist", default=None,
-                   help="dirbrute wordlist (default: auto-detect, mode-aware)")
     p.add_argument("--concurrency", type=int, default=800,
                    help="async scan concurrency (auto-retries once at a lower "
                         "concurrency if the first pass finds 0 ports, in case "
@@ -2238,46 +2121,6 @@ BANNER = r"""
  |_|  \___|\___\___/|_| |_|_/_/  /_/\_\
 """
 
-# candidate dirbrute wordlists, checked in order - seclists has renamed this
-# file across releases (DirBuster-2007_ prefix added, then dropped again), so
-# don't trust one hardcoded path. Mode-aware: quick wants something small and
-# fast, deep wants the biggest list actually installed.
-QUICK_WORDLISTS = [
-    "/usr/share/wordlists/dirb/common.txt",
-    "/usr/share/seclists/Discovery/Web-Content/common.txt",
-]
-DEFAULT_WORDLISTS = [
-    "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt",
-    "/usr/share/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt",
-    "/usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt",
-    "/usr/share/wordlists/dirb/common.txt",
-]
-DEEP_WORDLISTS = [
-    "/usr/share/seclists/Discovery/Web-Content/raft-large-directories.txt",
-    "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt",
-] + DEFAULT_WORDLISTS
-
-
-def resolve_wordlist(args):
-    """Fill in args.wordlist, verifying it actually exists on disk.
-
-    feroxbuster/gobuster exit 0 even when the wordlist path is bad, so a
-    silently-wrong default used to produce an empty dirbust with no warning.
-    """
-    if args.wordlist:
-        if not os.path.isfile(args.wordlist):
-            warn(f"wordlist not found: {args.wordlist} - dirbrute will be skipped")
-            args.wordlist = None
-        return
-    candidates = {"quick": QUICK_WORDLISTS, "deep": DEEP_WORDLISTS}.get(
-        getattr(args, "mode", None), DEFAULT_WORDLISTS)
-    found = _first_existing_file(candidates)
-    if found:
-        args.wordlist = found
-        return
-    warn("no default dirbrute wordlist found - pass --wordlist PATH (dirbrute will be skipped)")
-
-
 # top-1000-ish common TCP ports for --quick and the async fallback
 TOP_1000 = [1,3,7,9,13,17,19,21,22,23,25,26,37,53,79,80,81,88,106,110,111,113,119,135,139,143,144,179,199,389,427,443,444,445,465,513,514,515,543,544,548,554,587,631,646,873,990,993,995,1025,1026,1027,1028,1029,1110,1433,1434,1521,1720,1723,1755,1900,2000,2001,2049,2121,2717,3000,3128,3268,3269,3306,3389,3986,4899,5000,5009,5051,5060,5101,5190,5357,5432,5631,5666,5800,5900,5985,5986,6000,6001,6379,6646,7070,8000,8008,8009,8080,8081,8443,8888,9100,9200,9999,10000,27017,32768,49152,49153,49154,49155,49156,49157]
 
@@ -2300,7 +2143,6 @@ def apply_mode_defaults(args):
         args.no_udp = True
         args.no_scripts = True
     elif args.mode == "deep":
-        args.nikto = True
         if args.version_intensity is None:
             args.version_intensity = 9
     return args.mode
@@ -2309,16 +2151,15 @@ def apply_mode_defaults(args):
 async def amain(args):
     apply_mode_defaults(args)
     refresh_tools()
-    resolve_wordlist(args)
     runner = Runner(args.outdir, dry_run=args.dry_run,
                     timeout=args.timeout, verbose=args.verbose, resume=args.resume)
     runner.sem = asyncio.Semaphore(args.parallel)
 
     print(C.CY + BANNER + C.END)
     info(f"mode: {C.M}{args.mode}{C.END}  workers: {args.workers}  parallel: {args.parallel}")
-    missing = [t for t in ("rustscan", "nmap", "feroxbuster", "gobuster", "whatweb",
+    missing = [t for t in ("rustscan", "nmap",
                            "enum4linux-ng", "nxc", "netexec", "smtp-user-enum") if not TOOLS.get(t)]
-    have = [t for t in ("rustscan", "nmap", "feroxbuster", "gobuster", "whatweb",
+    have = [t for t in ("rustscan", "nmap",
                         "enum4linux-ng", "nxc", "netexec", "smbclient", "ldapsearch",
                         "snmpwalk", "curl", "smtp-user-enum") if TOOLS.get(t)]
     info(f"tools available: {C.G}{', '.join(have) or 'none'}{C.END}")
